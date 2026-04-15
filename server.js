@@ -361,17 +361,22 @@ function createServer() {
       bid_amount: z.number().optional().describe("Bid in CENTI USD. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests (ex: ['6003107902433','6003349442621'])"),
       pixel_id: z.string().optional().describe("ID pixel din list_pixels. Necesar pentru OFFSITE_CONVERSIONS."),
-      end_time: z.string().optional().describe("Data sfarsit ISO 8601")
+      end_time: z.string().optional().describe("Data sfarsit ISO 8601"),
+      advantage_audience: z.number().int().min(0).max(1).default(1).describe("Advantage Audience (obligatoriu din 2024): 1=activat (recomandat), 0=dezactivat")
     },
     async ({ campaign_id, name, daily_budget, age_min, age_max, genders, countries,
-             optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids, pixel_id, end_time }) => {
+             optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids, pixel_id, end_time, advantage_audience }) => {
       try {
         const targeting = { age_min, age_max, genders, geo_locations: { countries } };
         if (interest_ids?.length) {
           targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
         }
 
-        const body = { campaign_id, name, targeting, optimization_goal, billing_event, bid_strategy, status: "PAUSED" };
+        const body = {
+          campaign_id, name, targeting, optimization_goal, billing_event, bid_strategy,
+          status: "PAUSED",
+          advantage_audience
+        };
         if (daily_budget) body.daily_budget = daily_budget;
         if (bid_amount)   body.bid_amount = bid_amount;
         if (end_time)     body.end_time = end_time;
