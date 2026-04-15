@@ -63,7 +63,7 @@ const json = (obj) => ok(JSON.stringify(obj, null, 2));
 
 // ─── Server factory (stateless — o instanta per request) ──────────────────────
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "2.2.0" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "2.3.0-FINAL" });
 
   // ═══════════════════════════════════════════════════════════════════
   // BLOC 1 — INFORMATII CONT
@@ -836,14 +836,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "2.2.0",
+  version: "2.3.0-FINAL",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v2.2 running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v2.3-FINAL running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
