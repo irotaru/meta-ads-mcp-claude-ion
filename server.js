@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v2.5.0-Final
+ * Meta Ads MCP Server v2.6.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -41,7 +41,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "2.5.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "2.6.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -290,7 +290,7 @@ function createServer() {
       countries: z.array(z.string()).default(["RO"]).describe("Coduri ISO 2 (ex: ['RO','MD'])"),
       optimization_goal: z.enum(["LEAD_GENERATION","LINK_CLICKS","IMPRESSIONS","REACH","OFFSITE_CONVERSIONS","LANDING_PAGE_VIEWS","THRUPLAY"]).default("LEAD_GENERATION"),
       billing_event: z.enum(["IMPRESSIONS","LINK_CLICKS","THRUPLAY"]).default("IMPRESSIONS"),
-      bid_strategy: z.enum(["LOWEST_COST_WITHOUT_CAP","LOWEST_COST_WITH_BID_CAP","COST_CAP"]).default("LOWEST_COST_WITHOUT_CAP"),
+      bid_strategy: z.enum(["LOWEST_COST_WITHOUT_CAP","LOWEST_COST_WITH_BID_CAP","COST_CAP"]).optional().describe("Lasa gol pentru lowest cost fara cap (default Meta). Specifica doar daca vrei LOWEST_COST_WITH_BID_CAP sau COST_CAP (necesita bid_amount)."),
       bid_amount: z.number().optional().describe("Bid in CENTI USD. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests (ex: ['6003107902433'])"),
       pixel_id: z.string().optional().describe("ID pixel din list_pixels. Necesar pentru OFFSITE_CONVERSIONS."),
@@ -311,9 +311,10 @@ function createServer() {
         }
         const body = {
           campaign_id, name, targeting,
-          optimization_goal, billing_event, bid_strategy,
+          optimization_goal, billing_event,
           status: "PAUSED"
         };
+        if (bid_strategy) body.bid_strategy = bid_strategy;
         if (daily_budget) {
           body.daily_budget = daily_budget;
           body.is_adset_budget_sharing_enabled = is_adset_budget_sharing_enabled;
@@ -660,14 +661,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "2.5.0-Final",
+  version: "2.6.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v2.5.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v2.6.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
