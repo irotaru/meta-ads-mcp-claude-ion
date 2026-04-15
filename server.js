@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v2.4.0-Final
+ * Meta Ads MCP Server v2.5.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -41,7 +41,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "2.4.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "2.5.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -301,15 +301,18 @@ function createServer() {
              optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids, pixel_id,
              end_time, is_adset_budget_sharing_enabled }) => {
       try {
-        const targeting = { age_min, age_max, genders, geo_locations: { countries } };
+        const targeting = {
+          age_min, age_max, genders,
+          geo_locations: { countries },
+          targeting_automation: { advantage_audience }
+        };
         if (interest_ids?.length) {
           targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
         }
         const body = {
           campaign_id, name, targeting,
           optimization_goal, billing_event, bid_strategy,
-          status: "PAUSED",
-          targeting_automation: { advantage_audience }
+          status: "PAUSED"
         };
         if (daily_budget) {
           body.daily_budget = daily_budget;
@@ -657,14 +660,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "2.4.0-Final",
+  version: "2.5.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v2.4.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v2.5.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
