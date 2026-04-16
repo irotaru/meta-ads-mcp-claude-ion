@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v3.2.0-Final
+ * Meta Ads MCP Server v3.3.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -56,7 +56,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "3.2.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "3.3.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -308,6 +308,11 @@ function createServer() {
       bid_strategy: z.enum(["LOWEST_COST_WITHOUT_CAP","LOWEST_COST_WITH_BID_CAP","COST_CAP"]).optional().describe("Lasa gol pentru lowest cost fara cap (default Meta). Specifica doar daca vrei LOWEST_COST_WITH_BID_CAP sau COST_CAP (necesita bid_amount)."),
       bid_amount: z.number().optional().describe("Bid in CENTI USD. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests (ex: ['6003107902433']). Nota: cu advantage_audience=1 (AI), Meta poate extinde audienta dincolo de interesele specificate."),
+      excluded_interest_ids: z.array(z.string()).optional().describe("ID-uri interese de EXCLUS din targeting. Persoanele cu aceste interese NU vor vedea reclama. ID-urile vin din search_interests."),
+      excluded_geo_countries: z.array(z.string()).optional().describe("Coduri ISO 2 de EXCLUS geografic (ex: ['MD'] exclude Moldova din targetingul pe RO+MD)."),
+      excluded_geo_regions: z.array(z.object({ key: z.string() })).optional().describe("Regiuni/judete de EXCLUS. Cheia vine din search_locations (ex: [{key:'524008'}] exclude Ilfov)."),
+      excluded_geo_cities: z.array(z.object({ key: z.string(), radius: z.number().optional(), distance_unit: z.string().optional() })).optional().describe("Orase de EXCLUS. Cheia vine din search_locations (ex: [{key:'2618910', radius:25, distance_unit:'kilometer'}] exclude Bucuresti 25km)."),
+      excluded_custom_audience_ids: z.array(z.string()).optional().describe("ID-uri audionte custom de EXCLUS (din list_custom_audiences). Exemplu: excludi clientii existenti pentru prospecting curat."),
       excluded_audience_ids: z.array(z.string()).optional().describe("ID-uri audionte de EXCLUS (din list_custom_audiences). Exclude clientii existenti pentru prospecting curat."),
       publisher_platforms: z.array(z.enum(["facebook","instagram","audience_network","messenger"])).optional().describe("Platformele unde apare reclama. Gol = toate platformele."),
       facebook_positions: z.array(z.enum(["feed","right_hand_column","marketplace","story","search","reels","instream_video"])).optional().describe("Plasamentele pe Facebook. Nota: video_feeds a fost deprecat in v24.0 si nu mai este disponibil.").describe("Plasamentele pe Facebook (daca publisher_platforms include 'facebook')"),
@@ -322,7 +327,9 @@ function createServer() {
              optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids, pixel_id,
              end_time, is_adset_budget_sharing_enabled, excluded_audience_ids,
              publisher_platforms, facebook_positions, instagram_positions,
-             frequency_cap, frequency_cap_period }) => {
+             frequency_cap, frequency_cap_period,
+             excluded_interest_ids, excluded_geo_countries, excluded_geo_regions,
+             excluded_geo_cities, excluded_custom_audience_ids }) => {
       try {
         const targeting = {
           age_min, age_max, genders,
@@ -347,10 +354,26 @@ function createServer() {
         if (pixel_id && optimization_goal === "OFFSITE_CONVERSIONS") {
           body.promoted_object = { pixel_id, custom_event_type: "LEAD" };
         }
-        // Excluded audiences
-        if (excluded_audience_ids?.length) {
-          body.targeting.exclusions = { custom_audiences: excluded_audience_ids.map(id => ({ id })) };
+        // Exclusions — combina toate tipurile de excluderi intr-un singur obiect
+        const exclusions = {};
+        // Custom audiences exclusion
+        const allExcludedAudiences = [
+          ...(excluded_audience_ids || []).map(id => ({ id })),
+          ...(excluded_custom_audience_ids || []).map(id => ({ id }))
+        ];
+        if (allExcludedAudiences.length) exclusions.custom_audiences = allExcludedAudiences;
+        // Interests exclusion
+        if (excluded_interest_ids?.length) {
+          exclusions.interests = excluded_interest_ids.map(id => ({ id }));
         }
+        // Geo exclusions
+        const excluded_geo = {};
+        if (excluded_geo_countries?.length)  excluded_geo.countries = excluded_geo_countries;
+        if (excluded_geo_regions?.length)    excluded_geo.regions   = excluded_geo_regions;
+        if (excluded_geo_cities?.length)     excluded_geo.cities    = excluded_geo_cities;
+        if (Object.keys(excluded_geo).length) exclusions.geo_locations = excluded_geo;
+        // Apply exclusions if any
+        if (Object.keys(exclusions).length) body.targeting.exclusions = exclusions;
         // Placements
         if (publisher_platforms?.length) {
           body.targeting.publisher_platforms = publisher_platforms;
@@ -547,9 +570,12 @@ function createServer() {
       age_min: z.number().optional().describe("Noua varsta minima (18-65)"),
       age_max: z.number().optional().describe("Noua varsta maxima (18-65)"),
       genders: z.array(z.number()).optional().describe("1=Barbati 2=Femei [1,2]=Ambele"),
-      interest_ids: z.array(z.string()).optional().describe("Inlocuieste interesele cu aceste ID-uri din search_interests")
+      interest_ids: z.array(z.string()).optional().describe("Inlocuieste interesele cu aceste ID-uri din search_interests"),
+      excluded_interest_ids: z.array(z.string()).optional().describe("Interese de EXCLUS din targeting"),
+      excluded_geo_countries: z.array(z.string()).optional().describe("Tari de EXCLUS (coduri ISO 2)"),
+      excluded_custom_audience_ids: z.array(z.string()).optional().describe("Audionte custom de EXCLUS (ID-uri din list_custom_audiences)")
     },
-    async ({ adset_id, status, name, daily_budget, bid_amount, end_time, countries, age_min, age_max, genders, interest_ids }) => {
+    async ({ adset_id, status, name, daily_budget, bid_amount, end_time, countries, age_min, age_max, genders, interest_ids, excluded_interest_ids, excluded_geo_countries, excluded_custom_audience_ids }) => {
       try {
         const body = {};
         if (status)       body.status = status;
@@ -569,6 +595,12 @@ function createServer() {
           if (age_max !== undefined) targeting.age_max = age_max;
           if (genders)               targeting.genders = genders;
           if (interest_ids?.length)  targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
+          // Exclusions in update
+          const excl = { ...(targeting.exclusions || {}) };
+          if (excluded_interest_ids?.length)       excl.interests        = excluded_interest_ids.map(id => ({ id }));
+          if (excluded_geo_countries?.length)       excl.geo_locations    = { ...(excl.geo_locations||{}), countries: excluded_geo_countries };
+          if (excluded_custom_audience_ids?.length) excl.custom_audiences = excluded_custom_audience_ids.map(id => ({ id }));
+          if (Object.keys(excl).length) targeting.exclusions = excl;
           body.targeting = targeting;
         }
         if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
@@ -1050,14 +1082,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "3.2.0-Final",
+  version: "3.3.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v3.2.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v3.3.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
