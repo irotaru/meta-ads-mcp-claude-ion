@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v3.4.0-Final
+ * Meta Ads MCP Server v3.5.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -56,7 +56,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "3.4.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "3.5.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -720,10 +720,16 @@ function createServer() {
     {},
     async () => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/customaudiences?fields=id,name,subtype,approximate_count&limit=50`);
+        const d = await meta(`/act_${ACCOUNT}/customaudiences?fields=id,name,subtype,approximate_count_lower_bound,approximate_count_upper_bound,delivery_status&limit=50`);
         const a = d.data || [];
         if (!a.length) return ok("Nu exista audionte personalizate.");
-        return ok(`Audionte (${a.length}):\n${a.map(x=>`ID: ${x.id} | ${x.name} | ${x.subtype} | ~${(x.approximate_count||0).toLocaleString()} persoane`).join("\n")}`);
+        const lines = a.map(x => {
+          const low  = x.approximate_count_lower_bound ? parseInt(x.approximate_count_lower_bound).toLocaleString() : "?";
+          const high = x.approximate_count_upper_bound ? parseInt(x.approximate_count_upper_bound).toLocaleString() : "?";
+          const size = low === "?" ? "in procesare" : `${low} - ${high}`;
+          return `ID: ${x.id} | ${x.name} | ${x.subtype} | ~${size} persoane`;
+        });
+        return ok(`Audionte (${a.length}):\n${lines.join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -1339,14 +1345,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "3.4.0-Final",
+  version: "3.5.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v3.4.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v3.5.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
