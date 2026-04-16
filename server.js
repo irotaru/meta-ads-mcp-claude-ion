@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v3.3.0-Final
+ * Meta Ads MCP Server v3.4.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -56,7 +56,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "3.3.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "3.4.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -1057,6 +1057,263 @@ function createServer() {
     }
   );
 
+
+  // ── AUDIENTA RETARGETING ─────────────────────────────────────────────────
+
+  server.tool("create_website_audience",
+    "Creeaza audienta din vizitatori website (pixel-based). Tipul cel mai eficient de retargeting.",
+    {
+      name: z.string().describe("Numele audientei (ex: 'Vizitatori site 30 zile')"),
+      pixel_id: z.string().describe("ID-ul pixelului Meta din list_pixels"),
+      retention_days: z.number().min(1).max(180).default(30).describe("Perioada de retentie in zile (1-180). Ex: 30 = persoanele care au vizitat site-ul in ultimele 30 zile."),
+      event_name: z.enum([
+        "PageView",
+        "ViewContent",
+        "AddToCart",
+        "InitiateCheckout",
+        "Purchase",
+        "Lead",
+        "CompleteRegistration",
+        "Search",
+        "Contact",
+        "SubmitApplication"
+      ]).default("PageView").describe("Evenimentul pixel pe care se bazeaza audienta. PageView = toti vizitatorii, Purchase = cumparatori, Lead = persoane care au completat un formular."),
+      url_filter: z.string().optional().describe("Filtreaza dupa URL specific (ex: '/multumim' pentru persoanele care au ajuns pe pagina de multumire). Lasa gol pentru tot site-ul."),
+      description: z.string().optional().describe("Descrierea audientei pentru referinta interna")
+    },
+    async ({ name, pixel_id, retention_days, event_name, url_filter, description }) => {
+      try {
+        const rule = {
+          inclusions: {
+            operator: "or",
+            rules: [{
+              event_sources: [{ id: pixel_id, type: "pixel" }],
+              retention_seconds: retention_days * 86400,
+              filter: {
+                operator: "and",
+                filters: [
+                  { field: "event", operator: "eq", value: event_name },
+                  ...(url_filter ? [{ field: "url", operator: "contains", value: url_filter }] : [])
+                ]
+              }
+            }]
+          }
+        };
+
+        const body = {
+          name,
+          subtype: "WEBSITE",
+          description: description || `${event_name} - ultimele ${retention_days} zile`,
+          customer_file_source: "USER_PROVIDED_ONLY",
+          rule: JSON.stringify(rule)
+        };
+
+        const d = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", body);
+        return ok(`Audienta website creata!\nID: ${d.id}\nNume: ${name}\nEveniment: ${event_name}\nRetentie: ${retention_days} zile\n${url_filter ? "Filtru URL: " + url_filter + "\n" : ""}\nFoloseste ID-ul ${d.id} in create_adset pentru retargeting.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("create_engagement_audience",
+    "Creeaza audienta din persoanele care au interactionat cu pagina Facebook sau contul Instagram.",
+    {
+      name: z.string().describe("Numele audientei"),
+      source_type: z.enum([
+        "FACEBOOK_PAGE",
+        "INSTAGRAM_ACCOUNT",
+        "VIDEO",
+        "LEAD_FORM",
+        "EVENT"
+      ]).describe("Sursa de engagement: pagina Facebook, cont Instagram, video, formular lead gen sau eveniment."),
+      source_id: z.string().describe("ID-ul sursei: page_id (din get_pages), instagram_account_id (din list_instagram_accounts), video_id, form_id sau event_id."),
+      retention_days: z.number().min(1).max(365).default(30).describe("Perioada de retentie in zile (max 365)."),
+      engagement_type: z.enum([
+        "PAGE_ENGAGED_USERS",
+        "PAGE_VISITORS",
+        "PAGE_SAVED",
+        "PAGE_POST_INTERACTIONS",
+        "PAGE_AD_CLICKERS",
+        "INSTAGRAM_BUSINESS_PROFILE_ALL",
+        "INSTAGRAM_BUSINESS_PROFILE_ENGAGED",
+        "WATCH_85_PERCENT",
+        "WATCH_50_PERCENT",
+        "WATCH_25_PERCENT",
+        "OPENED_FORM",
+        "COMPLETED_FORM"
+      ]).describe("Tipul de interactiune: PAGE_ENGAGED_USERS = toti cei care au interactionat cu pagina, INSTAGRAM_BUSINESS_PROFILE_ALL = toti vizitatorii profilului IG, OPENED_FORM = cei care au deschis formularul lead gen.")
+    },
+    async ({ name, source_type, source_id, retention_days, engagement_type }) => {
+      try {
+        const subtype_map = {
+          FACEBOOK_PAGE:    "PAGE",
+          INSTAGRAM_ACCOUNT: "INSTAGRAM_BUSINESS",
+          VIDEO:            "VIDEO",
+          LEAD_FORM:        "LEAD_GENERATION",
+          EVENT:            "EVENT"
+        };
+
+        const body = {
+          name,
+          subtype: subtype_map[source_type],
+          description: `Engagement ${source_type} - ultimele ${retention_days} zile`,
+          retention_days,
+          rule: JSON.stringify({
+            inclusions: {
+              operator: "or",
+              rules: [{
+                event_sources: [{ id: source_id, type: source_type.toLowerCase() }],
+                retention_seconds: retention_days * 86400,
+                filter: {
+                  operator: "and",
+                  filters: [{ field: "event", operator: "eq", value: engagement_type }]
+                }
+              }]
+            }
+          })
+        };
+
+        const d = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", body);
+        return ok(`Audienta engagement creata!\nID: ${d.id}\nNume: ${name}\nSursa: ${source_type} (${source_id})\nTip engagement: ${engagement_type}\nRetentie: ${retention_days} zile\n\nFoloseste ID-ul ${d.id} in create_adset pentru retargeting.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("create_customer_list_audience",
+    "Creeaza audienta din lista de clienti (emailuri sau numere de telefon). Meta le hashuieste automat si cauta matching.",
+    {
+      name: z.string().describe("Numele audientei (ex: 'Clienti existenti')"),
+      data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor: EMAIL sau PHONE"),
+      values: z.array(z.string()).min(1).max(1000).describe("Lista de emailuri (ex: ['user@exemplu.ro', 'alt@exemplu.ro']) sau telefoane (ex: ['+40712345678']). Max 1000 per request."),
+      description: z.string().optional()
+    },
+    async ({ name, data_type, values, description }) => {
+      try {
+        // Step 1: Create the audience
+        const audience = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", {
+          name,
+          subtype: "CUSTOM",
+          description: description || `Lista ${data_type.toLowerCase()} - ${values.length} intrari`,
+          customer_file_source: "USER_PROVIDED_ONLY"
+        });
+
+        // Step 2: Hash and upload data (SHA-256 normalizat)
+        const crypto = await import("crypto");
+        const normalize = (val, type) => {
+          if (type === "EMAIL") return val.toLowerCase().trim();
+          if (type === "PHONE") return val.replace(/\D/g, ""); // doar cifre
+          return val;
+        };
+        const hashed = values.map(v => {
+          const normalized = normalize(v, data_type);
+          return crypto.createHash("sha256").update(normalized).digest("hex");
+        });
+
+        const field_map = { EMAIL: "EMAIL", PHONE: "PHONE" };
+        await meta(`/${audience.id}/users`, "POST", {
+          payload: {
+            schema: [field_map[data_type]],
+            data: hashed.map(h => [h])
+          }
+        });
+
+        return ok(`Audienta lista clienti creata!\nID: ${audience.id}\nNume: ${name}\nTip: ${data_type}\nIntrari uploadate: ${values.length}\n\nMeta va procesa lista si va gasi matching in 24-48 ore.\nFoloseste ID-ul ${audience.id} in create_adset pentru retargeting.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("get_audience_details",
+    "Vede detalii despre o audienta: marimea, statusul de livrare si tipul.",
+    {
+      audience_id: z.string().describe("ID-ul audientei din list_custom_audiences")
+    },
+    async ({ audience_id }) => {
+      try {
+        const fields = "id,name,subtype,approximate_count,delivery_status,data_source,retention_days,rule,description,time_created,time_updated";
+        const d = await meta(`/${audience_id}?fields=${fields}`);
+        const status = d.delivery_status?.description || d.delivery_status?.code || "necunoscut";
+        const count  = d.approximate_count ? parseInt(d.approximate_count).toLocaleString() : "in procesare";
+        return ok(`Audienta: ${d.name}\nID: ${d.id}\nTip: ${d.subtype}\nMarime estimata: ~${count} persoane\nStatus livrare: ${status}\nRetentie: ${d.retention_days || "-"} zile\nCreata: ${d.time_created ? new Date(d.time_created * 1000).toLocaleDateString("ro-RO") : "-"}\nActualizata: ${d.time_updated ? new Date(d.time_updated * 1000).toLocaleDateString("ro-RO") : "-"}`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("delete_audience",
+    "Sterge o audienta custom. Atentie: actiunea este ireversibila.",
+    {
+      audience_id: z.string().describe("ID-ul audientei de sters")
+    },
+    async ({ audience_id }) => {
+      try {
+        await meta(`/${audience_id}`, "DELETE");
+        return ok(`Audienta ${audience_id} stearsa definitiv.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("add_users_to_audience",
+    "Adauga utilizatori intr-o audienta existenta (emailuri sau telefoane). Util pentru actualizarea listelor de clienti.",
+    {
+      audience_id: z.string().describe("ID-ul audientei din list_custom_audiences"),
+      data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor"),
+      values: z.array(z.string()).min(1).max(1000).describe("Lista de emailuri sau telefoane de adaugat")
+    },
+    async ({ audience_id, data_type, values }) => {
+      try {
+        const crypto = await import("crypto");
+        const normalize = (val, type) => {
+          if (type === "EMAIL") return val.toLowerCase().trim();
+          if (type === "PHONE") return val.replace(/\D/g, "");
+          return val;
+        };
+        const hashed = values.map(v => {
+          const n = normalize(v, data_type);
+          return crypto.createHash("sha256").update(n).digest("hex");
+        });
+
+        await meta(`/${audience_id}/users`, "POST", {
+          payload: {
+            schema: [data_type],
+            data: hashed.map(h => [h])
+          }
+        });
+
+        return ok(`${values.length} utilizatori adaugati in audienta ${audience_id}.\nMeta va procesa in 24-48 ore.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("remove_users_from_audience",
+    "Elimina utilizatori dintr-o audienta (emailuri sau telefoane).",
+    {
+      audience_id: z.string().describe("ID-ul audientei"),
+      data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor"),
+      values: z.array(z.string()).min(1).max(1000).describe("Lista de emailuri sau telefoane de eliminat")
+    },
+    async ({ audience_id, data_type, values }) => {
+      try {
+        const crypto = await import("crypto");
+        const normalize = (val, type) => {
+          if (type === "EMAIL") return val.toLowerCase().trim();
+          if (type === "PHONE") return val.replace(/\D/g, "");
+          return val;
+        };
+        const hashed = values.map(v => {
+          const n = normalize(v, data_type);
+          return crypto.createHash("sha256").update(n).digest("hex");
+        });
+
+        await meta(`/${audience_id}/users`, "DELETE", {
+          payload: {
+            schema: [data_type],
+            data: hashed.map(h => [h])
+          }
+        });
+
+        return ok(`${values.length} utilizatori eliminati din audienta ${audience_id}.`);
+      } catch (e) { return err(e); }
+    }
+  );
+
   return server;
 }
 
@@ -1082,14 +1339,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "3.3.0-Final",
+  version: "3.4.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v3.3.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v3.4.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
