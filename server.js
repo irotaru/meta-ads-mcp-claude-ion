@@ -1,5 +1,5 @@
 /**
- * Meta Ads MCP Server v2.6.0-Final
+ * Meta Ads MCP Server v2.8.0-Final
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0 (Feb 2026)
  * 31 tools: analiza, creare campanii, creative, audienta, lead forms
@@ -41,7 +41,7 @@ const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }]
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "2.6.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "2.8.0-Final" });
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
@@ -445,12 +445,24 @@ function createServer() {
     {
       adset_id: z.string().describe("ID Ad Set din create_adset"),
       creative_id: z.string().describe("ID creative din create_creative / create_video_creative / create_carousel_creative"),
-      name: z.string().describe("Numele Ad-ului")
+      name: z.string().describe("Numele Ad-ului"),
+      multi_advertiser_ads: z.boolean().default(true).describe("Multi-advertiser ads: true=activat (Meta afiseaza reclama alaturi de alte reclame similare), false=dezactivat (reclama apare singura). Dezactiveaza daca vrei control complet asupra plasamentului."),
+      url_tags: z.string().optional().describe("Parametri UTM pentru tracking (ex: 'utm_source=facebook&utm_medium=paid&utm_campaign=test')"),
+      conversion_domain: z.string().optional().describe("Domeniul de conversie (ex: 'exemplu.ro'). Recomandat pentru campanii cu pixel.")
     },
-    async ({ adset_id, creative_id, name }) => {
+    async ({ adset_id, creative_id, name, multi_advertiser_ads, url_tags, conversion_domain }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/ads`, "POST", { adset_id, creative: { creative_id }, name, status: "PAUSED" });
-        return ok(`Ad creat cu succes! Campania este gata.\nID: ${d.id}\nNume: ${name}\nStatus: PAUSED\n\nActiveaza cu update_campaign_status cand esti gata sa difuzezi.`);
+        const body = {
+          adset_id,
+          creative: { creative_id },
+          name,
+          status: "PAUSED",
+          multi_advertiser_eligibility: multi_advertiser_ads ? "eligible" : "not_eligible"
+        };
+        if (url_tags)          body.creative = { ...body.creative, url_tags };
+        if (conversion_domain) body.conversion_domain = conversion_domain;
+        const d = await meta(`/act_${ACCOUNT}/ads`, "POST", body);
+        return ok(`Ad creat cu succes!\nID: ${d.id}\nNume: ${name}\nStatus: PAUSED\nMulti-advertiser: ${multi_advertiser_ads ? "activat" : "dezactivat"}\n\nActiveaza cu update_campaign_status cand esti gata sa difuzezi.`);
       } catch (e) { return err(e); }
     }
   );
@@ -479,24 +491,41 @@ function createServer() {
   );
 
   server.tool("update_adset",
-    "Modifica un Ad Set: buget, status, bid sau data de sfarsit",
+    "Modifica un Ad Set: status, buget, bid, targeting (tari/varsta/gen/interese), nume sau programare",
     {
-      adset_id: z.string(),
-      status: z.enum(["ACTIVE","PAUSED"]).optional(),
-      daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD"),
-      bid_amount: z.number().optional().describe("Bid in CENTI USD"),
-      end_time: z.string().optional().describe("Data sfarsit ISO 8601")
+      adset_id: z.string().describe("ID-ul Ad Set-ului de modificat"),
+      status: z.enum(["ACTIVE","PAUSED"]).optional().describe("Activeaza sau pauzeaza ad set-ul"),
+      name: z.string().optional().describe("Noul nume al Ad Set-ului"),
+      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI USD (ex: 2000=$20)"),
+      bid_amount: z.number().optional().describe("Noul bid in CENTI USD"),
+      end_time: z.string().optional().describe("Data de sfarsit ISO 8601"),
+      countries: z.array(z.string()).optional().describe("Inlocuieste targetingul geografic (ex: ['RO','MD'])"),
+      age_min: z.number().optional().describe("Noua varsta minima (18-65)"),
+      age_max: z.number().optional().describe("Noua varsta maxima (18-65)"),
+      genders: z.array(z.number()).optional().describe("1=Barbati 2=Femei [1,2]=Ambele"),
+      interest_ids: z.array(z.string()).optional().describe("Inlocuieste interesele cu aceste ID-uri din search_interests")
     },
-    async ({ adset_id, status, daily_budget, bid_amount, end_time }) => {
+    async ({ adset_id, status, name, daily_budget, bid_amount, end_time, countries, age_min, age_max, genders, interest_ids }) => {
       try {
         const body = {};
         if (status)       body.status = status;
+        if (name)         body.name = name;
         if (daily_budget) body.daily_budget = daily_budget;
         if (bid_amount)   body.bid_amount = bid_amount;
         if (end_time)     body.end_time = end_time;
+        if (countries || age_min !== undefined || age_max !== undefined || genders || interest_ids) {
+          const current = await meta(`/${adset_id}?fields=targeting`);
+          const targeting = { ...(current.targeting || {}) };
+          if (countries)             targeting.geo_locations = { ...targeting.geo_locations, countries };
+          if (age_min !== undefined) targeting.age_min = age_min;
+          if (age_max !== undefined) targeting.age_max = age_max;
+          if (genders)               targeting.genders = genders;
+          if (interest_ids?.length)  targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
+          body.targeting = targeting;
+        }
         if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
         await meta(`/${adset_id}`, "POST", body);
-        return ok(`Ad Set ${adset_id} actualizat.`);
+        return ok(`Ad Set ${adset_id} actualizat.\nCampuri modificate: ${Object.keys(body).join(", ")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -508,6 +537,35 @@ function createServer() {
       try {
         await meta(`/${ad_id}`, "POST", { status });
         return ok(`${status==="ACTIVE"?"▶":"⏸"} Ad ${ad_id} → ${status}`);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  server.tool("update_ad",
+    "Modifica un Ad existent: status, nume, creative, multi-advertiser ads si alte optiuni",
+    {
+      ad_id: z.string().describe("ID-ul Ad-ului de modificat"),
+      status: z.enum(["ACTIVE","PAUSED"]).optional().describe("Activeaza sau pauzeaza ad-ul"),
+      name: z.string().optional().describe("Noul nume al Ad-ului"),
+      creative_id: z.string().optional().describe("ID-ul noului creative. Inlocuieste creative-ul existent."),
+      multi_advertiser_ads: z.boolean().optional().describe("Multi-advertiser ads: true=activat, false=dezactivat. Dezactiveaza daca vrei reclama sa apara singura, fara reclame similare alaturi."),
+      conversion_domain: z.string().optional().describe("Actualizeaza domeniul de conversie (ex: 'exemplu.ro')")
+    },
+    async ({ ad_id, status, name, creative_id, multi_advertiser_ads, conversion_domain }) => {
+      try {
+        const body = {};
+        if (status)      body.status = status;
+        if (name)        body.name = name;
+        if (creative_id) body.creative = { creative_id };
+        if (multi_advertiser_ads !== undefined) body.multi_advertiser_eligibility = multi_advertiser_ads ? "eligible" : "not_eligible";
+        if (conversion_domain) body.conversion_domain = conversion_domain;
+        if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
+        await meta(`/${ad_id}`, "POST", body);
+        const changes = Object.keys(body).map(k => {
+          if (k === "multi_advertiser_eligibility") return `multi_advertiser: ${body[k]}`;
+          return k;
+        }).join(", ");
+        return ok(`Ad ${ad_id} actualizat.\nCampuri modificate: ${changes}`);
       } catch (e) { return err(e); }
     }
   );
@@ -661,14 +719,14 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "2.6.0-Final",
+  version: "2.8.0-Final",
   account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
   token: TOKEN ? "configured" : "NOT SET",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v2.6.0-Final running on port ${PORT}`);
+  console.log(`Meta Ads MCP Server v2.8.0-Final running on port ${PORT}`);
   if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
   if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
 });
