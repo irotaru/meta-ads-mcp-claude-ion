@@ -1,7 +1,12 @@
 /**
- * Meta Ads MCP Server v4.0.0
+ * Meta Ads MCP Server v4.1.0
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0
+ *
+ * CHANGELOG v4.1.0 (vs 4.0.0):
+ *  - Auth prin query parameter ?key=SECRET (compatibil Claude.ai custom connector UI)
+ *  - Suport paralel pentru Authorization: Bearer header (alti clienti MCP)
+ *  - Timing-safe comparison pentru secret (previne timing attacks)
  *
  * CHANGELOG v4.0.0 (vs 3.5.0):
  *  - Multi-account support: ad_account_id optional in toate tool-urile
@@ -9,7 +14,7 @@
  *  - Tool nou: list_ad_accounts — listeaza toate conturile accesibile de token
  *  - Tool nou: get_campaign_full — agregă campaign + adsets + ads + insights
  *  - SECURITY: token in Authorization header, nu in URL (elimina leak risk in logs)
- *  - SECURITY: autentificare obligatorie pe /mcp cu MCP_SECRET header
+ *  - SECURITY: autentificare obligatorie pe /mcp cu MCP_SECRET
  *  - Retry pe 5xx erori tranzitorii (500, 502, 503, 504), nu doar 429
  *  - Fail-fast la boot daca lipsesc env vars critice
  *  - frequency_cap returneaza warning daca e ignorat, nu silent
@@ -22,6 +27,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { z } from "zod";
+import { timingSafeEqual } from "crypto";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const TOKEN         = process.env.META_ADS_ACCESS_TOKEN;
@@ -162,7 +168,7 @@ const accountParam = {
 
 // ── Server definition ────────────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "4.0.0" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "4.1.0" });
 
   // ══ ACCOUNTS MULTI-TENANT ═════════════════════════════════════════════════
   server.tool("list_ad_accounts",
@@ -1562,14 +1568,32 @@ function createServer() {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// Middleware de autentificare — pe TOATE endpoint-urile POST /mcp
+// Middleware de autentificare — accepta secret prin:
+//   1. Query parameter: ?key=SECRET (compatibil cu Claude.ai custom connectors)
+//   2. Authorization: Bearer SECRET header (pentru clienti care suporta custom headers)
+// Timing-safe comparison ca sa previna timing attacks
 function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization || "";
-  const providedSecret = auth.replace(/^Bearer\s+/i, "").trim();
-  if (!providedSecret || providedSecret !== MCP_SECRET) {
+  const queryKey  = req.query.key || "";
+  const headerKey = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+  const provided  = queryKey || headerKey;
+
+  if (!provided) {
     return res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32001, message: "Unauthorized: Bearer token lipsa sau invalid in Authorization header" },
+      error: { code: -32001, message: "Unauthorized: lipsa parametru 'key' in query sau header 'Authorization: Bearer'" },
+      id: null
+    });
+  }
+
+  // Timing-safe comparison
+  const a = Buffer.from(provided);
+  const b = Buffer.from(MCP_SECRET);
+  const valid = a.length === b.length && timingSafeEqual(a, b);
+
+  if (!valid) {
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized: secret invalid" },
       id: null
     });
   }
@@ -1596,7 +1620,7 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "4.0.0",
+  version: "4.1.0",
   token_configured: !!TOKEN,
   secret_configured: !!MCP_SECRET,
   default_account: DEFAULT_ACCT ? `act_${normalizeAccountId(DEFAULT_ACCT)}` : "NOT SET (multi-account mode)",
@@ -1604,9 +1628,9 @@ app.get("/health", (_, res) => res.json({
 }));
 
 app.listen(PORT, () => {
-  console.log(`✓ Meta Ads MCP Server v4.0.0 running on port ${PORT}`);
+  console.log(`✓ Meta Ads MCP Server v4.1.0 running on port ${PORT}`);
   console.log(`✓ Token: configured`);
-  console.log(`✓ MCP secret: configured`);
+  console.log(`✓ MCP secret: configured (auth via ?key= query param sau Bearer header)`);
   console.log(DEFAULT_ACCT
     ? `✓ Default account: act_${normalizeAccountId(DEFAULT_ACCT)} (override cu ad_account_id per call)`
     : `ℹ Multi-account mode: fiecare tool call necesita ad_account_id explicit`
