@@ -1,7 +1,17 @@
 /**
- * Meta Ads MCP Server v4.4.0
+ * Meta Ads MCP Server v4.5.0
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0
+ *
+ * CHANGELOG v4.5.0 (vs 4.4.0):
+ *  - Tool nou: get_insights_breakdown — raport demografic/geografic/plasament pe tot contul
+ *      - breakdown 1D sau 2D (age, gender, country, region, dma, device_platform,
+ *        publisher_platform, platform_position, impression_device, hourly_*)
+ *      - whitelist combinatii 2D validate (Meta respinge silent cele invalide)
+ *      - warning Type 1 cand region/dma + obiective off-Meta (nu returneaza lead actions)
+ *      - sortare spend/cpl/leads/ctr/impressions + filtru min_spend
+ *      - sectiune TOP 5 CPL (min 2 leads) + FLOP 5 waste (spend > 0 & leads = 0)
+ *      - agregat pe tot contul (level=account), economiseste apeluri per-campanie
  *
  * CHANGELOG v4.4.0 (vs 4.3.0):
  *  - Tool nou: get_campaigns_with_performance — campanii + insights intr-un apel, join server-side
@@ -294,7 +304,7 @@ const accountParam = {
 
 // ── Server definition ────────────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "4.4.0" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "4.5.0" });
 
   // ══ ACCOUNTS MULTI-TENANT ═════════════════════════════════════════════════
   server.tool("list_ad_accounts",
@@ -502,6 +512,215 @@ function createServer() {
         if (breakdown !== "none") url += `&breakdowns=${breakdown}`;
         const d = await meta(url);
         return json(d.data || d);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  // Raport demografic/geografic agregat pe tot contul, cu breakdown single sau 2D.
+  // Decizii cheie:
+  //  - Scope: act_XXX/insights (nu un obiect punctual) — raspunde la "cine converteste pe contul meu"
+  //  - Whitelist combinatii 2D (Meta respinge silent invalidele — nu mai ghicim)
+  //  - Warning cand region/dma + lead goal (Type 1 restriction — nu returneaza lead actions offsite)
+  //  - Top 10 / Bottom 10 automat dupa spend / CPL / CTR / leads
+  server.tool("get_insights_breakdown",
+    "Raport demografic/geografic/platforma pe tot contul cu breakdown 1D sau 2D (ex: age+gender, region+device_platform). Agregheaza toate campaniile si returneaza top/flop automat. Perfect pentru: 'cine converteste', 'care segment risipeste buget', 'unde sa duplic campaniile'.",
+    {
+      ...accountParam,
+      date_preset: z.enum(["today","yesterday","last_7d","last_14d","last_30d","last_90d"]).default("last_30d").describe("Perioada — recomandat last_30d pentru demografic (semnificatie statistica)"),
+      breakdown_1: z.enum([
+        "age", "gender", "country", "region", "dma",
+        "impression_device", "device_platform", "platform_position", "publisher_platform",
+        "hourly_stats_aggregated_by_advertiser_time_zone"
+      ]).describe("Breakdown principal. age/gender=demografic | country/region/dma=geografic | device/platform/position=plasament | hourly=ora zilei"),
+      breakdown_2: z.enum([
+        "none",
+        "age", "gender", "country", "region",
+        "impression_device", "device_platform", "platform_position", "publisher_platform"
+      ]).default("none").describe("Breakdown secundar OPTIONAL (2D). Meta valideaza strict combinatiile — vezi lista valide mai jos. Lasa 'none' pentru single breakdown."),
+      sort_by: z.enum(["spend","cpl","leads","ctr","impressions"]).default("spend").describe("Criteriu sortare. spend/leads/impressions=descendent | cpl/ctr=ascendent (cel mai bun sus pentru cpl)"),
+      min_spend: z.number().default(0).describe("Prag minim spend (valuta contului) — filtreaza segmentele cu spend nesemnificativ. Ex: 5 = ignora segmentele cu <5 EUR"),
+      top_n: z.number().default(15).describe("Cate segmente sa afiseze (default 15, max 100)"),
+      show_top_flop: z.boolean().default(true).describe("Afiseaza sectiune separata TOP 5 / FLOP 5 la final")
+    },
+    async ({ ad_account_id, date_preset, breakdown_1, breakdown_2, sort_by, min_spend, top_n, show_top_flop }) => {
+      try {
+        const acct = resolveAccount(ad_account_id);
+        const currency = await getAccountCurrency(acct);
+        const limit = Math.min(Math.max(1, top_n), 100);
+
+        // Whitelist combinatii 2D verificate — Meta respinge silent pe cele invalide
+        // Sursa: docs oficial + testare empirica. Tine doar combinatiile care returneaza date util
+        const valid2D = new Set([
+          // Demografic
+          "age|gender", "gender|age",
+          // Demografic × Geografic
+          "age|country", "country|age",
+          "gender|country", "country|gender",
+          "age|region", "region|age",
+          "gender|region", "region|gender",
+          // Demografic × Plasament/Device
+          "age|device_platform", "device_platform|age",
+          "gender|device_platform", "device_platform|gender",
+          "age|publisher_platform", "publisher_platform|age",
+          "gender|publisher_platform", "publisher_platform|gender",
+          "age|platform_position", "platform_position|age",
+          "gender|platform_position", "platform_position|gender",
+          "age|impression_device", "impression_device|age",
+          "gender|impression_device", "impression_device|gender",
+          // Geografic × Plasament
+          "country|device_platform", "device_platform|country",
+          "country|publisher_platform", "publisher_platform|country",
+          "region|device_platform", "device_platform|region",
+          "region|publisher_platform", "publisher_platform|region",
+          // Plasament combinat
+          "publisher_platform|platform_position", "platform_position|publisher_platform",
+          "publisher_platform|device_platform", "device_platform|publisher_platform",
+          "publisher_platform|impression_device", "impression_device|publisher_platform"
+        ]);
+
+        // Validare combinatie 2D
+        const is2D = breakdown_2 !== "none";
+        if (is2D) {
+          const key = `${breakdown_1}|${breakdown_2}`;
+          if (!valid2D.has(key)) {
+            return ok(
+              `⚠ Combinatia ${breakdown_1} + ${breakdown_2} nu e suportata de Meta API (sau returneaza date incomplete).\n\n` +
+              `Combinatii valide cu ${breakdown_1}:\n` +
+              [...valid2D].filter(k => k.startsWith(breakdown_1 + "|")).map(k => "  • " + k.split("|")[1]).join("\n") +
+              `\n\nAlternativa: ruleaza 2 apeluri separate cu breakdown_1 diferit.`
+            );
+          }
+        }
+
+        // Warning Type 1: region/dma + obiective de lead pe site
+        // Meta NU returneaza lead actions offsite pentru region/dma (doar on-Meta events)
+        const warnings = [];
+        const hasGeoType1 = [breakdown_1, breakdown_2].some(b => ["region","dma"].includes(b));
+        if (hasGeoType1) {
+          warnings.push(
+            `⚠ Breakdown ${["region","dma"].find(b => [breakdown_1, breakdown_2].includes(b))} ` +
+            `NU returneaza lead/conversion actions pentru evenimente off-Meta (website leads prin pixel). ` +
+            `Daca bazezi CPL pe pixel, vei vedea 0 leads. Functioneaza corect pentru on-Meta: instant forms, messenger, page engagement.`
+          );
+        }
+
+        // Fetch insights
+        const breakdownsParam = is2D ? `${breakdown_1},${breakdown_2}` : breakdown_1;
+        const fields = "spend,impressions,clicks,reach,frequency,ctr,cpc,cpm,actions";
+        const { data: rawData } = await metaPaginated(
+          `/act_${acct}/insights?fields=${fields}&breakdowns=${breakdownsParam}&date_preset=${date_preset}&level=account&limit=500`,
+          { maxItems: 2000, maxPages: 10 }
+        );
+
+        if (!rawData.length) {
+          return ok(`Nu exista date pentru ${breakdownsParam} in perioada ${date_preset}.`);
+        }
+
+        // Normalizare rows — extrag valorile breakdown + metrici derivate
+        const rows = rawData.map(r => {
+          const spend = parseFloat(r.spend || 0);
+          const impressions = parseInt(r.impressions || 0);
+          const clicks = parseInt(r.clicks || 0);
+          const reach = parseInt(r.reach || 0);
+          const ctr = parseFloat(r.ctr || 0);
+          const cpc = parseFloat(r.cpc || 0);
+          const cpm = parseFloat(r.cpm || 0);
+          const frequency = parseFloat(r.frequency || 0);
+          const leads = r.actions
+            ? parseInt(r.actions.find(a => ["lead","onsite_conversion.lead_grouped"].includes(a.action_type))?.value || 0)
+            : 0;
+          const cpl = leads > 0 ? spend / leads : null;
+
+          // Label pentru segment — combina cele 2 breakdown-uri daca e cazul
+          const v1 = r[breakdown_1] ?? "—";
+          const v2 = is2D ? (r[breakdown_2] ?? "—") : null;
+          const label = is2D ? `${v1} × ${v2}` : String(v1);
+
+          return { label, v1, v2, spend, impressions, clicks, reach, ctr, cpc, cpm, frequency, leads, cpl };
+        });
+
+        // Filtru min_spend
+        const filtered = rows.filter(r => r.spend >= min_spend);
+        if (!filtered.length) {
+          return ok(`Dupa filtru min_spend=${fmtMoney(min_spend, currency)}, nu mai raman segmente. Scade pragul.`);
+        }
+
+        // Sortare — numere raw, null-safe
+        const sortFn = {
+          spend: (a, b) => b.spend - a.spend,
+          leads: (a, b) => b.leads - a.leads,
+          impressions: (a, b) => b.impressions - a.impressions,
+          ctr: (a, b) => a.ctr - b.ctr,   // CTR mic = rau in sus ca sa vezi problemele
+          cpl: (a, b) => {                // CPL null (0 leads) la coada
+            if (a.cpl === null && b.cpl === null) return 0;
+            if (a.cpl === null) return 1;
+            if (b.cpl === null) return -1;
+            return a.cpl - b.cpl;         // CPL mic = bun in sus
+          }
+        };
+        filtered.sort(sortFn[sort_by]);
+
+        const display = filtered.slice(0, limit);
+        const truncated = filtered.length > limit;
+
+        // Totaluri globale (din filtered, nu din display — sa fie reprezentative)
+        const totalSpend = filtered.reduce((s, r) => s + r.spend, 0);
+        const totalLeads = filtered.reduce((s, r) => s + r.leads, 0);
+        const totalImpressions = filtered.reduce((s, r) => s + r.impressions, 0);
+        const totalClicks = filtered.reduce((s, r) => s + r.clicks, 0);
+        const avgCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
+        const avgCtr = totalImpressions > 0 ? (totalClicks / totalImpressions) * 100 : 0;
+
+        // Build output
+        const breakdownLabel = is2D ? `${breakdown_1} × ${breakdown_2}` : breakdown_1;
+        let out = `=== RAPORT ${breakdownLabel.toUpperCase()} | ${date_preset} | cont: act_${acct} | valuta: ${currency} ===\n`;
+        out += `Sortare: ${sort_by} | Filtru: spend ≥ ${fmtMoney(min_spend, currency)} | Segmente: ${display.length}/${filtered.length}\n`;
+        out += `TOTAL: ${fmtMoney(totalSpend, currency)} cheltuit | ${totalLeads} leads | CPL mediu: ${avgCpl !== null ? fmtMoney(avgCpl, currency) : "N/A"} | CTR mediu: ${avgCtr.toFixed(2)}%\n`;
+        if (warnings.length) out += `\n${warnings.join("\n")}\n`;
+        out += `\n`;
+
+        // Tabel principal
+        for (const r of display) {
+          const cplStr = r.cpl !== null ? fmtMoney(r.cpl, currency) : (r.spend > 0 ? "0 leads" : "—");
+          const spendPct = totalSpend > 0 ? ((r.spend / totalSpend) * 100).toFixed(1) : "0.0";
+          out += `${r.label}\n`;
+          out += `   Spend: ${fmtMoney(r.spend, currency)} (${spendPct}%) | Imp: ${r.impressions.toLocaleString()} | Leads: ${r.leads} | CPL: ${cplStr}\n`;
+          out += `   CTR: ${r.ctr.toFixed(2)}% | CPC: ${fmtMoney(r.cpc, currency)} | CPM: ${fmtMoney(r.cpm, currency)} | Freq: ${r.frequency.toFixed(2)}\n\n`;
+        }
+
+        if (truncated) {
+          out += `... ${filtered.length - limit} segmente suplimentare (creste top_n pentru a le vedea)\n\n`;
+        }
+
+        // Top/Flop automat — util pentru decizii rapide
+        if (show_top_flop && filtered.length >= 4) {
+          // TOP 5 dupa leads (cu CPL rezonabil — nu segmentele care au 1 lead intamplator)
+          const withLeads = filtered.filter(r => r.leads >= 2);
+          if (withLeads.length >= 2) {
+            const bestCpl = [...withLeads].sort((a, b) => a.cpl - b.cpl).slice(0, 5);
+            out += `━━━ TOP 5 dupa CPL (min 2 leads) ━━━\n`;
+            bestCpl.forEach((r, i) => {
+              out += `${i+1}. ${r.label} → ${fmtMoney(r.cpl, currency)} CPL | ${r.leads} leads | ${fmtMoney(r.spend, currency)} spend\n`;
+            });
+            out += `\n`;
+          }
+
+          // FLOP 5 — cheltuiala mare, zero leads (adevaratele pierderi)
+          const wasters = filtered
+            .filter(r => r.leads === 0 && r.spend > 0)
+            .sort((a, b) => b.spend - a.spend)
+            .slice(0, 5);
+          if (wasters.length) {
+            const totalWasted = wasters.reduce((s, r) => s + r.spend, 0);
+            out += `━━━ FLOP 5: cheltuiala fara leads (${fmtMoney(totalWasted, currency)} irositi) ━━━\n`;
+            wasters.forEach((r, i) => {
+              out += `${i+1}. ${r.label} → ${fmtMoney(r.spend, currency)} spend | 0 leads | CTR ${r.ctr.toFixed(2)}%\n`;
+            });
+            out += `\n`;
+          }
+        }
+
+        return ok(out);
       } catch (e) { return err(e); }
     }
   );
@@ -1913,7 +2132,7 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "4.4.0",
+  version: "4.5.0",
   token_configured: !!TOKEN,
   secret_configured: !!MCP_SECRET,
   default_account: DEFAULT_ACCT ? `act_${normalizeAccountId(DEFAULT_ACCT)}` : "NOT SET (multi-account mode)",
@@ -1921,7 +2140,7 @@ app.get("/health", (_, res) => res.json({
 }));
 
 app.listen(PORT, () => {
-  console.log(`✓ Meta Ads MCP Server v4.4.0 running on port ${PORT}`);
+  console.log(`✓ Meta Ads MCP Server v4.5.0 running on port ${PORT}`);
   console.log(`✓ Token: configured`);
   console.log(`✓ MCP secret: configured (auth via ?key= query param sau Bearer header)`);
   console.log(DEFAULT_ACCT
