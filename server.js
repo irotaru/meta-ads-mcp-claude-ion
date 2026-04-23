@@ -1,8 +1,21 @@
 /**
- * Meta Ads MCP Server v3.5.0-Final
+ * Meta Ads MCP Server v4.0.0
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
- * Meta Marketing API v25.0 (Feb 2026)
- * 31 tools: analiza, creare campanii, creative, audienta, lead forms
+ * Meta Marketing API v25.0
+ *
+ * CHANGELOG v4.0.0 (vs 3.5.0):
+ *  - Multi-account support: ad_account_id optional in toate tool-urile
+ *    (fallback pe META_AD_ACCOUNT_ID env var pentru backward compat)
+ *  - Tool nou: list_ad_accounts — listeaza toate conturile accesibile de token
+ *  - Tool nou: get_campaign_full — agregă campaign + adsets + ads + insights
+ *  - SECURITY: token in Authorization header, nu in URL (elimina leak risk in logs)
+ *  - SECURITY: autentificare obligatorie pe /mcp cu MCP_SECRET header
+ *  - Retry pe 5xx erori tranzitorii (500, 502, 503, 504), nu doar 429
+ *  - Fail-fast la boot daca lipsesc env vars critice
+ *  - frequency_cap returneaza warning daca e ignorat, nu silent
+ *  - update_ad: removed creative_id (Meta API nu permite schimbarea creative-ului)
+ *  - Paginare pe list endpoints via cursor next
+ *  - Mesaje eroare mai clare cand ad_account_id lipseste
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,38 +23,100 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express";
 import { z } from "zod";
 
-const TOKEN   = process.env.META_ADS_ACCESS_TOKEN;
-const ACCOUNT = process.env.META_AD_ACCOUNT_ID;
-const API     = "https://graph.facebook.com/v25.0";
-const PORT    = process.env.PORT || 3000;
+// ── Config ───────────────────────────────────────────────────────────────────
+const TOKEN         = process.env.META_ADS_ACCESS_TOKEN;
+const DEFAULT_ACCT  = process.env.META_AD_ACCOUNT_ID; // fallback pentru backward compat
+const MCP_SECRET    = process.env.MCP_SECRET;
+const API           = "https://graph.facebook.com/v25.0";
+const PORT          = process.env.PORT || 3000;
 
-async function meta(path, method = "GET", body = null, retries = 3) {
-  if (!TOKEN)   throw new Error("META_ADS_ACCESS_TOKEN lipsa din Railway Variables");
-  if (!ACCOUNT && !path.startsWith("/me") && !path.match(/^\/\d{10,}/)) {
-    throw new Error("META_AD_ACCOUNT_ID lipsa din Railway Variables");
+// Fail-fast la boot — oprim serverul daca lipsesc variabile critice
+function validateEnv() {
+  const missing = [];
+  if (!TOKEN)      missing.push("META_ADS_ACCESS_TOKEN");
+  if (!MCP_SECRET) missing.push("MCP_SECRET");
+  if (missing.length) {
+    console.error(`\n❌ CONFIGURARE INVALIDA: Variabile lipsa in Railway:\n   - ${missing.join("\n   - ")}`);
+    console.error(`\nServer oprit. Seteaza variabilele si redeploy.\n`);
+    process.exit(1);
   }
+  if (!DEFAULT_ACCT) {
+    console.warn(`⚠ META_AD_ACCOUNT_ID nesetat — fiecare tool call va necesita ad_account_id explicit.`);
+  }
+}
+validateEnv();
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+/** Normalizeaza un ID de cont: accepta "1234567890", "act_1234567890" → intoarce "1234567890" */
+function normalizeAccountId(id) {
+  if (!id) return null;
+  return String(id).replace(/^act_/, "");
+}
+
+/** Rezolva contul de folosit: param explicit > env var default. Arunca eroare clara daca lipsesc ambele. */
+function resolveAccount(explicit) {
+  const acct = normalizeAccountId(explicit) || normalizeAccountId(DEFAULT_ACCT);
+  if (!acct) {
+    throw new Error(
+      "Nu este specificat ad_account_id si nici META_AD_ACCOUNT_ID nu e setat in Railway. " +
+      "Foloseste list_ad_accounts pentru a vedea conturile disponibile si specifica ad_account_id in parametri."
+    );
+  }
+  return acct;
+}
+
+/**
+ * Apelul central catre Graph API.
+ * - Token in Authorization header (nu in URL)
+ * - Retry cu backoff exponential pe 429 + 5xx
+ * - Timeout 30s cu AbortController
+ * - Parsing eroare Meta cu cod, subcod, user_msg
+ */
+async function meta(path, method = "GET", body = null, retries = 3) {
+  if (!TOKEN) throw new Error("META_ADS_ACCESS_TOKEN lipsa (probabil server restart necesar).");
+
   const base    = path.startsWith("http") ? path : `${API}${path}`;
-  const fullUrl = `${base}${base.includes("?") ? "&" : "?"}access_token=${TOKEN}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
-  const opts = { method, headers: { "Content-Type": "application/json" }, signal: controller.signal };
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  const opts = {
+    method,
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${TOKEN}`
+    },
+    signal: controller.signal
+  };
   if (body) opts.body = JSON.stringify(body);
+
   let res;
   try {
-    res = await fetch(fullUrl, opts);
+    res = await fetch(base, opts);
     clearTimeout(timeout);
   } catch (e) {
     clearTimeout(timeout);
     if (e.name === "AbortError") throw new Error("Timeout: requestul a durat peste 30 secunde");
+    // Network errors — retry daca mai sunt incercari
+    if (retries > 0) {
+      await new Promise(r => setTimeout(r, (4 - retries) * 1000));
+      return meta(path, method, body, retries - 1);
+    }
     throw new Error(`Retea: ${e.message}`);
   }
-  // 429 Rate Limit — retry cu backoff exponential
-  if (res.status === 429 && retries > 0) {
+
+  // Retry pe 429 (rate limit) + 5xx (server errors tranzitorii)
+  if ((res.status === 429 || res.status >= 500) && retries > 0) {
     const wait = (4 - retries) * 2000; // 2s, 4s, 6s
     await new Promise(r => setTimeout(r, wait));
     return meta(path, method, body, retries - 1);
   }
-  const data = await res.json();
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`Meta API: raspuns non-JSON (HTTP ${res.status})`);
+  }
+
   if (data.error) {
     const code = data.error.code || data.error.error_code || "?";
     const msg  = data.error.error_user_msg || data.error.error_message || data.error.message;
@@ -51,20 +126,75 @@ async function meta(path, method = "GET", body = null, retries = 3) {
   return data;
 }
 
+/**
+ * Fetch cu paginare automata — parcurge cursor.next pana la limit total sau pana la capat.
+ * Returneaza { data: [...], total_fetched, has_more }
+ */
+async function metaPaginated(path, { maxPages = 5, maxItems = 500 } = {}) {
+  const allData = [];
+  let url = path;
+  let pages = 0;
+
+  while (url && pages < maxPages && allData.length < maxItems) {
+    const d = await meta(url);
+    if (d.data) allData.push(...d.data);
+    url = d.paging?.next || null;
+    pages++;
+    if (allData.length >= maxItems) break;
+  }
+  return {
+    data: allData.slice(0, maxItems),
+    total_fetched: allData.length,
+    has_more: !!url
+  };
+}
+
 const ok   = (t) => ({ content: [{ type: "text", text: String(t) }] });
 const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }], isError: true });
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
+// Schema reutilizabila — ad_account_id optional in fiecare tool
+const accountParam = {
+  ad_account_id: z.string().optional().describe(
+    "ID cont de publicitate (cu sau fara prefix 'act_'). Daca lipseste, foloseste default-ul din Railway (META_AD_ACCOUNT_ID). Listeaza conturile disponibile cu list_ad_accounts."
+  )
+};
+
+// ── Server definition ────────────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "3.5.0-Final" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "4.0.0" });
+
+  // ══ ACCOUNTS MULTI-TENANT ═════════════════════════════════════════════════
+  server.tool("list_ad_accounts",
+    "Listeaza toate conturile de publicitate la care token-ul are acces. Esential pentru agentii cu mai multi clienti. Returneaza ID-uri utilizabile in ad_account_id peste tot.",
+    {},
+    async () => {
+      try {
+        const { data } = await metaPaginated(
+          `/me/adaccounts?fields=id,name,account_status,currency,timezone_name,amount_spent,business&limit=100`,
+          { maxPages: 10, maxItems: 500 }
+        );
+        if (!data.length) return ok("Niciun cont gasit. Verifica permisiunile token-ului in Business Manager.");
+
+        const s = { 1:"ACTIV", 2:"DEZACTIVAT", 3:"NEPLATIT", 7:"POLITICI", 9:"INCHIS", 100:"PENDING", 101:"INVALID" };
+        const lines = data.map(a => {
+          const spent = ((a.amount_spent || 0) / 100).toFixed(2);
+          const biz   = a.business ? ` | ${a.business.name}` : "";
+          return `${a.id} | ${a.name} | ${s[a.account_status] || a.account_status} | ${a.currency} | Cheltuit: ${spent} ${a.currency}${biz}`;
+        });
+        return ok(`Conturi accesibile (${data.length}):\n${lines.join("\n")}\n\nFoloseste ID-ul (ex: act_123456) ca parametru ad_account_id in orice tool.`);
+      } catch (e) { return err(e); }
+    }
+  );
 
   // ── CONT ─────────────────────────────────────────────────────────────────
   server.tool("get_account_info",
     "Informatii cont: status, valuta, cheltuieli totale, business manager",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}?fields=id,name,account_status,currency,timezone_name,amount_spent,business`);
+        const acct = resolveAccount(ad_account_id);
+        const d = await meta(`/act_${acct}?fields=id,name,account_status,currency,timezone_name,amount_spent,business`);
         const s = { 1:"ACTIV", 2:"DEZACTIVAT", 3:"NEPLATIT", 7:"POLITICI", 9:"INCHIS" };
         return ok([
           `Cont: ${d.name} (${d.id})`,
@@ -79,18 +209,19 @@ function createServer() {
 
   server.tool("get_pages",
     "Listeaza paginile Facebook. Returneaza page_id necesar pentru create_creative.",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
         let pages = [];
         try {
-          const d = await meta(`/me/accounts?fields=id,name,category,fan_count&limit=50`);
-          pages = d.data || [];
+          const { data } = await metaPaginated(`/me/accounts?fields=id,name,category,fan_count&limit=50`);
+          pages = data;
         } catch {
-          const biz = await meta(`/act_${ACCOUNT}?fields=business`);
+          const acct = resolveAccount(ad_account_id);
+          const biz = await meta(`/act_${acct}?fields=business`);
           if (biz.business) {
-            const d = await meta(`/${biz.business.id}/owned_pages?fields=id,name,category,fan_count&limit=50`);
-            pages = d.data || [];
+            const { data } = await metaPaginated(`/${biz.business.id}/owned_pages?fields=id,name,category,fan_count&limit=50`);
+            pages = data;
           }
         }
         if (!pages.length) return ok("Nicio pagina Facebook gasita. Verifica Business Manager.");
@@ -101,13 +232,13 @@ function createServer() {
 
   server.tool("list_pixels",
     "Listeaza pixelii Meta. Necesar pentru campanii cu OFFSITE_CONVERSIONS.",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/adspixels?fields=id,name,last_fired_time&limit=25`);
-        const p = d.data || [];
-        if (!p.length) return ok("Niciun pixel gasit. Creeaza unul in Meta Events Manager.");
-        return ok(`Pixeli (${p.length}):\n${p.map(x=>{
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(`/act_${acct}/adspixels?fields=id,name,last_fired_time&limit=25`);
+        if (!data.length) return ok("Niciun pixel gasit. Creeaza unul in Meta Events Manager.");
+        return ok(`Pixeli (${data.length}):\n${data.map(x=>{
           const last = x.last_fired_time ? new Date(x.last_fired_time*1000).toLocaleDateString("ro-RO") : "Niciodata";
           return `ID: ${x.id} | ${x.name} | Ultimul foc: ${last}`;
         }).join("\n")}`);
@@ -117,13 +248,13 @@ function createServer() {
 
   server.tool("list_instagram_accounts",
     "Listeaza conturile Instagram conectate.",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/instagram_accounts?fields=id,username&limit=25`);
-        const a = d.data || [];
-        if (!a.length) return ok("Niciun cont Instagram conectat.");
-        return ok(`Instagram (${a.length}):\n${a.map(x=>`ID: ${x.id} | @${x.username}`).join("\n")}`);
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(`/act_${acct}/instagram_accounts?fields=id,username&limit=25`);
+        if (!data.length) return ok("Niciun cont Instagram conectat.");
+        return ok(`Instagram (${data.length}):\n${data.map(x=>`ID: ${x.id} | @${x.username}`).join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -131,17 +262,26 @@ function createServer() {
   // ── CITIRE CAMPANII ───────────────────────────────────────────────────────
   server.tool("list_campaigns",
     "Listeaza campaniile din cont cu status, obiectiv si buget",
-    { status: z.enum(["ACTIVE","PAUSED","ARCHIVED","ALL"]).default("ALL") },
-    async ({ status }) => {
+    {
+      ...accountParam,
+      status: z.enum(["ACTIVE","PAUSED","ARCHIVED","ALL"]).default("ALL"),
+      max_results: z.number().default(100).describe("Numar max de campanii (default 100, max 500 via paginare)")
+    },
+    async ({ ad_account_id, status, max_results }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const f = status === "ALL" ? "" : `&effective_status=["${status}"]`;
-        const d = await meta(`/act_${ACCOUNT}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget${f}&limit=100`);
-        const c = d.data || [];
-        if (!c.length) return ok("Nu exista campanii.");
-        return ok(`Campanii (${c.length}):\n${c.map(x=>{
+        const { data, has_more } = await metaPaginated(
+          `/act_${acct}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget${f}&limit=100`,
+          { maxItems: Math.min(max_results, 500) }
+        );
+        if (!data.length) return ok("Nu exista campanii.");
+        const lines = data.map(x=>{
           const b = x.daily_budget ? `${(x.daily_budget/100).toFixed(2)}$/zi` : x.lifetime_budget ? `${(x.lifetime_budget/100).toFixed(2)}$ total` : "-";
           return `ID: ${x.id} | ${x.name} | ${x.status} | ${x.objective} | ${b}`;
-        }).join("\n")}`);
+        });
+        const tail = has_more ? `\n\n(Mai multe disponibile — creste max_results pentru a le vedea)` : "";
+        return ok(`Campanii (${data.length}):\n${lines.join("\n")}${tail}`);
       } catch (e) { return err(e); }
     }
   );
@@ -151,8 +291,11 @@ function createServer() {
     { campaign_id: z.string().describe("ID-ul campaniei") },
     async ({ campaign_id }) => {
       try {
-        const d = await meta(`/${campaign_id}/adsets?fields=id,name,status,daily_budget,targeting,optimization_goal&limit=100`);
-        return json(d.data || []);
+        const { data } = await metaPaginated(
+          `/${campaign_id}/adsets?fields=id,name,status,daily_budget,targeting,optimization_goal&limit=100`,
+          { maxItems: 500 }
+        );
+        return json(data);
       } catch (e) { return err(e); }
     }
   );
@@ -162,21 +305,24 @@ function createServer() {
     { adset_id: z.string().describe("ID-ul Ad Set-ului") },
     async ({ adset_id }) => {
       try {
-        const d = await meta(`/${adset_id}/ads?fields=id,name,status,creative{id,name}&limit=100`);
-        return json(d.data || []);
+        const { data } = await metaPaginated(
+          `/${adset_id}/ads?fields=id,name,status,creative{id,name}&limit=100`,
+          { maxItems: 500 }
+        );
+        return json(data);
       } catch (e) { return err(e); }
     }
   );
 
   server.tool("list_images",
     "Listeaza imaginile uploadate in cont. Reutilizeaza hash-ul pentru creative noi.",
-    { limit: z.number().default(25) },
-    async ({ limit }) => {
+    { ...accountParam, limit: z.number().default(25) },
+    async ({ ad_account_id, limit }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/adimages?fields=hash,name,url,width,height,status&limit=${limit}`);
-        const i = d.data || [];
-        if (!i.length) return ok("Nu exista imagini uploadate.");
-        return ok(`Imagini (${i.length}):\n${i.map(x=>`Hash: ${x.hash} | ${x.name||"fara_nume"} | ${x.width}x${x.height}px`).join("\n")}`);
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(`/act_${acct}/adimages?fields=hash,name,url,width,height,status&limit=${limit}`);
+        if (!data.length) return ok("Nu exista imagini uploadate.");
+        return ok(`Imagini (${data.length}):\n${data.map(x=>`Hash: ${x.hash} | ${x.name||"fara_nume"} | ${x.width}x${x.height}px`).join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -185,16 +331,20 @@ function createServer() {
   server.tool("get_all_insights",
     "Raport complet CPL/ROAS pentru toate campaniile. Foloseste pentru monitorizare zilnica.",
     {
+      ...accountParam,
       date_preset: z.enum(["today","yesterday","last_7d","last_14d","last_30d","last_90d"]).default("last_7d"),
       level: z.enum(["campaign","adset","ad"]).default("campaign")
     },
-    async ({ date_preset, level }) => {
+    async ({ ad_account_id, date_preset, level }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const fields = "campaign_name,campaign_id,adset_name,adset_id,spend,impressions,clicks,reach,frequency,ctr,cpc,actions,cost_per_action_type";
-        const d = await meta(`/act_${ACCOUNT}/insights?fields=${fields}&date_preset=${date_preset}&level=${level}&limit=200`);
-        const rows = d.data || [];
-        if (!rows.length) return ok("Nu exista date pentru perioada selectata.");
-        return json(rows);
+        const { data } = await metaPaginated(
+          `/act_${acct}/insights?fields=${fields}&date_preset=${date_preset}&level=${level}&limit=200`,
+          { maxItems: 1000 }
+        );
+        if (!data.length) return ok("Nu exista date pentru perioada selectata.");
+        return json(data);
       } catch (e) { return err(e); }
     }
   );
@@ -220,16 +370,20 @@ function createServer() {
   server.tool("analyze_wasted_spend",
     "Identifica ad set-urile care cheltuiesc fara conversii. Esential pentru optimizarea CPL.",
     {
+      ...accountParam,
       date_preset: z.enum(["last_7d","last_14d","last_30d"]).default("last_7d"),
       cpl_threshold: z.number().default(3).describe("Prag CPL in dolari — ad set-urile peste acest prag sunt ineficiente")
     },
-    async ({ date_preset, cpl_threshold }) => {
+    async ({ ad_account_id, date_preset, cpl_threshold }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const fields = "campaign_name,adset_name,spend,actions,cost_per_action_type,impressions";
-        const d = await meta(`/act_${ACCOUNT}/insights?fields=${fields}&date_preset=${date_preset}&level=adset&limit=200`);
-        const rows = d.data || [];
+        const { data } = await metaPaginated(
+          `/act_${acct}/insights?fields=${fields}&date_preset=${date_preset}&level=adset&limit=200`,
+          { maxItems: 500 }
+        );
         const wasted = [], good = [];
-        for (const r of rows) {
+        for (const r of data) {
           const spend = parseFloat(r.spend || 0);
           const leads = parseInt((r.actions||[]).find(a=>["lead","onsite_conversion.lead_grouped"].includes(a.action_type))?.value || 0);
           const cpl = leads > 0 ? spend / leads : null;
@@ -249,16 +403,20 @@ function createServer() {
   server.tool("detect_creative_fatigue",
     "Detecteaza reclame cu frecventa ridicata si CTR in scadere.",
     {
+      ...accountParam,
       date_preset: z.enum(["last_7d","last_14d","last_30d"]).default("last_14d"),
       frequency_threshold: z.number().default(2.5).describe("Frecventa peste care creativul e considerat obosit")
     },
-    async ({ date_preset, frequency_threshold }) => {
+    async ({ ad_account_id, date_preset, frequency_threshold }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const fields = "ad_name,ad_id,campaign_name,adset_name,spend,frequency,ctr,reach";
-        const d = await meta(`/act_${ACCOUNT}/insights?fields=${fields}&date_preset=${date_preset}&level=ad&limit=200`);
-        const rows = d.data || [];
-        const fatigued = rows.filter(r=>parseFloat(r.frequency||0)>=frequency_threshold).sort((a,b)=>parseFloat(b.frequency)-parseFloat(a.frequency));
-        const fine = rows.filter(r=>parseFloat(r.frequency||0)<frequency_threshold);
+        const { data } = await metaPaginated(
+          `/act_${acct}/insights?fields=${fields}&date_preset=${date_preset}&level=ad&limit=200`,
+          { maxItems: 500 }
+        );
+        const fatigued = data.filter(r=>parseFloat(r.frequency||0)>=frequency_threshold).sort((a,b)=>parseFloat(b.frequency)-parseFloat(a.frequency));
+        const fine = data.filter(r=>parseFloat(r.frequency||0)<frequency_threshold);
         let out = `=== FATIGUE CREATIVE (prag: ${frequency_threshold}) ===\n\nOBOSITE (${fatigued.length}):\n`;
         fatigued.forEach(r => out += `  ! ${r.ad_name}\n    ${r.campaign_name} | Frecventa: ${parseFloat(r.frequency).toFixed(1)} | CTR: ${parseFloat(r.ctr||0).toFixed(2)}%\n\n`);
         out += `OK (${fine.length}) — frecventa sub prag\n`;
@@ -267,26 +425,105 @@ function createServer() {
     }
   );
 
+  // Tool NOU: get_campaign_full — agregă tot într-un apel
+  server.tool("get_campaign_full",
+    "Returneaza campanie + ad set-uri + ad-uri + insights intr-un singur apel. Economiseste context window vs 4 apeluri separate. Ideal pentru audit rapid al unei campanii.",
+    {
+      campaign_id: z.string().describe("ID-ul campaniei"),
+      date_preset: z.enum(["today","yesterday","last_7d","last_14d","last_30d","last_90d"]).default("last_7d"),
+      include_ads: z.boolean().default(true).describe("Daca sa includa lista de ad-uri per ad set (poate creste output-ul)")
+    },
+    async ({ campaign_id, date_preset, include_ads }) => {
+      try {
+        // 1. Campanie
+        const campaign = await meta(`/${campaign_id}?fields=id,name,status,objective,daily_budget,lifetime_budget,special_ad_categories,created_time,start_time,stop_time`);
+
+        // 2. Ad sets
+        const { data: adsets } = await metaPaginated(
+          `/${campaign_id}/adsets?fields=id,name,status,daily_budget,optimization_goal,billing_event,bid_strategy,targeting&limit=100`,
+          { maxItems: 200 }
+        );
+
+        // 3. Insights per ad set + overall
+        const fields = "spend,impressions,clicks,reach,frequency,ctr,cpc,cpm,actions,cost_per_action_type";
+        const [overallInsights, adsetInsights] = await Promise.all([
+          meta(`/${campaign_id}/insights?fields=${fields}&date_preset=${date_preset}`).catch(() => ({ data: [] })),
+          meta(`/${campaign_id}/insights?fields=${fields},adset_id,adset_name&date_preset=${date_preset}&level=adset&limit=200`).catch(() => ({ data: [] }))
+        ]);
+
+        const insightsByAdset = {};
+        for (const row of (adsetInsights.data || [])) {
+          insightsByAdset[row.adset_id] = row;
+        }
+
+        // 4. Ads per adset (optional)
+        let adsByAdset = {};
+        if (include_ads) {
+          const adPromises = adsets.map(as =>
+            metaPaginated(`/${as.id}/ads?fields=id,name,status,creative{id,name,thumbnail_url}&limit=50`, { maxItems: 100 })
+              .then(r => ({ adset_id: as.id, ads: r.data }))
+              .catch(() => ({ adset_id: as.id, ads: [] }))
+          );
+          const results = await Promise.all(adPromises);
+          for (const r of results) adsByAdset[r.adset_id] = r.ads;
+        }
+
+        // 5. Asamblare rezultat
+        const result = {
+          campaign: {
+            id: campaign.id,
+            name: campaign.name,
+            status: campaign.status,
+            objective: campaign.objective,
+            daily_budget: campaign.daily_budget ? `$${(campaign.daily_budget/100).toFixed(2)}/zi` : null,
+            lifetime_budget: campaign.lifetime_budget ? `$${(campaign.lifetime_budget/100).toFixed(2)} total` : null,
+            special_ad_categories: campaign.special_ad_categories || []
+          },
+          performance_overall: (overallInsights.data || [])[0] || null,
+          adsets: adsets.map(as => ({
+            id: as.id,
+            name: as.name,
+            status: as.status,
+            daily_budget: as.daily_budget ? `$${(as.daily_budget/100).toFixed(2)}/zi` : null,
+            optimization_goal: as.optimization_goal,
+            billing_event: as.billing_event,
+            bid_strategy: as.bid_strategy,
+            geo: as.targeting?.geo_locations?.countries || [],
+            age: `${as.targeting?.age_min || "?"}-${as.targeting?.age_max || "?"}`,
+            genders: as.targeting?.genders || [],
+            performance: insightsByAdset[as.id] || null,
+            ads: include_ads ? (adsByAdset[as.id] || []) : undefined
+          })),
+          period: date_preset
+        };
+
+        return json(result);
+      } catch (e) { return err(e); }
+    }
+  );
+
   // ── CREARE CAMPANIE ───────────────────────────────────────────────────────
   server.tool("create_campaign",
     "Pas 1/5: Creeaza o campanie noua (PAUSED). Returneaza campaign_id pentru create_adset.",
     {
+      ...accountParam,
       name: z.string().describe("Numele campaniei"),
       objective: z.enum(["OUTCOME_LEADS","OUTCOME_SALES","OUTCOME_TRAFFIC","OUTCOME_AWARENESS","OUTCOME_ENGAGEMENT","OUTCOME_APP_PROMOTION"]).describe("Obiectivul campaniei"),
       daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD (1000=$10). Nu combina cu lifetime_budget. Lasa gol daca vrei buget per ad set."),
       lifetime_budget: z.number().optional().describe("Buget total in CENTI USD. Necesita stop_time."),
       stop_time: z.string().optional().describe("Data sfarsit ISO 8601. Necesar cu lifetime_budget."),
-      special_ad_categories: z.array(z.string()).default([]).describe("Categorii speciale obligatorii pentru anumite industrii: CREDIT (credite/imprumuturi), EMPLOYMENT (angajari), HOUSING (imobiliare), ISSUES_ELECTIONS_POLITICS. Targeting restrictionat pentru aceste categorii — nu se poate targeta dupa varsta, gen, cod postal.")
+      special_ad_categories: z.array(z.string()).default([]).describe("Categorii speciale obligatorii: CREDIT, EMPLOYMENT, HOUSING, ISSUES_ELECTIONS_POLITICS. Targeting restrictionat pentru aceste categorii.")
     },
-    async ({ name, objective, daily_budget, lifetime_budget, stop_time, special_ad_categories }) => {
+    async ({ ad_account_id, name, objective, daily_budget, lifetime_budget, stop_time, special_ad_categories }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         if (daily_budget && lifetime_budget) throw new Error("Foloseste fie daily_budget fie lifetime_budget, nu ambele.");
         if (lifetime_budget && !stop_time) throw new Error("lifetime_budget necesita stop_time.");
         const body = { name, objective, status: "PAUSED", special_ad_categories };
         if (daily_budget)    body.daily_budget = daily_budget;
         if (lifetime_budget) body.lifetime_budget = lifetime_budget;
         if (stop_time)       body.stop_time = stop_time;
-        const d = await meta(`/act_${ACCOUNT}/campaigns`, "POST", body);
+        const d = await meta(`/act_${acct}/campaigns`, "POST", body);
         return ok(`Campanie creata!\nID: ${d.id}\nNume: ${name}\nObiectiv: ${objective}\nStatus: PAUSED\n\nPasul urmator: create_adset cu campaign_id="${d.id}"`);
       } catch (e) { return err(e); }
     }
@@ -295,9 +532,10 @@ function createServer() {
   server.tool("create_adset",
     "Pas 2/5: Creeaza un Ad Set cu targeting complet. Returneaza adset_id pentru create_ad.",
     {
+      ...accountParam,
       campaign_id: z.string().describe("ID campanie din create_campaign"),
       name: z.string().describe("Numele Ad Set-ului"),
-      advantage_audience: z.union([z.literal(0), z.literal(1)]).describe("OBLIGATORIU (Meta API v25). 0=targeting MANUAL exact (varsta/gen/interese respectate strict). 1=Advantage+ AI (Meta extinde automat audienta). Alege 0 pentru audienta specifica, 1 pentru lead gen broad."),
+      advantage_audience: z.union([z.literal(0), z.literal(1)]).describe("OBLIGATORIU (Meta API v25). 0=targeting MANUAL exact (varsta/gen/interese respectate strict). 1=Advantage+ AI (Meta extinde automat). Alege 0 pentru audienta specifica, 1 pentru lead gen broad."),
       daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD (1000=$10). Lasa gol daca campania are CBO."),
       age_min: z.number().default(18).describe("Varsta minima (18-65)"),
       age_max: z.number().default(65).describe("Varsta maxima (18-65)"),
@@ -307,30 +545,36 @@ function createServer() {
       billing_event: z.enum(["IMPRESSIONS","LINK_CLICKS","THRUPLAY"]).default("IMPRESSIONS"),
       bid_strategy: z.enum(["LOWEST_COST_WITHOUT_CAP","LOWEST_COST_WITH_BID_CAP","COST_CAP"]).optional().describe("Lasa gol pentru lowest cost fara cap (default Meta). Specifica doar daca vrei LOWEST_COST_WITH_BID_CAP sau COST_CAP (necesita bid_amount)."),
       bid_amount: z.number().optional().describe("Bid in CENTI USD. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
-      interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests (ex: ['6003107902433']). Nota: cu advantage_audience=1 (AI), Meta poate extinde audienta dincolo de interesele specificate."),
-      excluded_interest_ids: z.array(z.string()).optional().describe("ID-uri interese de EXCLUS din targeting. Persoanele cu aceste interese NU vor vedea reclama. ID-urile vin din search_interests."),
-      excluded_geo_countries: z.array(z.string()).optional().describe("Coduri ISO 2 de EXCLUS geografic (ex: ['MD'] exclude Moldova din targetingul pe RO+MD)."),
-      excluded_geo_regions: z.array(z.object({ key: z.string() })).optional().describe("Regiuni/judete de EXCLUS. Cheia vine din search_locations (ex: [{key:'524008'}] exclude Ilfov)."),
-      excluded_geo_cities: z.array(z.object({ key: z.string(), radius: z.number().optional(), distance_unit: z.string().optional() })).optional().describe("Orase de EXCLUS. Cheia vine din search_locations (ex: [{key:'2618910', radius:25, distance_unit:'kilometer'}] exclude Bucuresti 25km)."),
-      excluded_custom_audience_ids: z.array(z.string()).optional().describe("ID-uri audionte custom de EXCLUS (din list_custom_audiences). Exemplu: excludi clientii existenti pentru prospecting curat."),
-      excluded_audience_ids: z.array(z.string()).optional().describe("ID-uri audionte de EXCLUS (din list_custom_audiences). Exclude clientii existenti pentru prospecting curat."),
-      publisher_platforms: z.array(z.enum(["facebook","instagram","audience_network","messenger"])).optional().describe("Platformele unde apare reclama. Gol = toate platformele."),
-      facebook_positions: z.array(z.enum(["feed","right_hand_column","marketplace","story","search","reels","instream_video"])).optional().describe("Plasamentele pe Facebook. Nota: video_feeds a fost deprecat in v24.0 si nu mai este disponibil.").describe("Plasamentele pe Facebook (daca publisher_platforms include 'facebook')"),
-      instagram_positions: z.array(z.enum(["stream","story","explore","reels","profile_feed","ig_search"])).optional().describe("Plasamentele pe Instagram (daca publisher_platforms include 'instagram')"),
-      frequency_cap: z.number().optional().describe("Limita maxima de afisari per utilizator. IMPORTANT: Acceptat DOAR pentru optimization_goal REACH sau IMPRESSIONS. Ignorat pentru alte obiective."),
-      frequency_cap_period: z.enum(["DAILY","WEEKLY","MONTHLY"]).default("WEEKLY").optional().describe("Perioada pentru frequency cap"),
+      interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests. Nota: cu advantage_audience=1, Meta poate extinde audienta."),
+      excluded_interest_ids: z.array(z.string()).optional().describe("ID-uri interese de EXCLUS din targeting."),
+      excluded_geo_countries: z.array(z.string()).optional().describe("Coduri ISO 2 de EXCLUS geografic."),
+      excluded_geo_regions: z.array(z.object({ key: z.string() })).optional().describe("Regiuni/judete de EXCLUS. Key din search_locations."),
+      excluded_geo_cities: z.array(z.object({ key: z.string(), radius: z.number().optional(), distance_unit: z.string().optional() })).optional().describe("Orase de EXCLUS. Key din search_locations."),
+      excluded_custom_audience_ids: z.array(z.string()).optional().describe("ID-uri audionte custom de EXCLUS. Ex: clientii existenti pentru prospecting curat."),
+      publisher_platforms: z.array(z.enum(["facebook","instagram","audience_network","messenger"])).optional().describe("Platformele unde apare reclama. Gol = toate."),
+      facebook_positions: z.array(z.enum(["feed","right_hand_column","marketplace","story","search","reels","instream_video"])).optional(),
+      instagram_positions: z.array(z.enum(["stream","story","explore","reels","profile_feed","ig_search"])).optional(),
+      frequency_cap: z.number().optional().describe("Limita max afisari per user. ACCEPTAT DOAR pentru optimization_goal REACH sau IMPRESSIONS."),
+      frequency_cap_period: z.enum(["DAILY","WEEKLY","MONTHLY"]).default("WEEKLY").optional(),
       pixel_id: z.string().optional().describe("ID pixel din list_pixels. Necesar pentru OFFSITE_CONVERSIONS."),
       end_time: z.string().optional().describe("Data sfarsit ISO 8601"),
-      is_adset_budget_sharing_enabled: z.boolean().default(true).describe("v24.0+: Permite partajarea bugetului intre ad set-uri. Obligatoriu cand setezi budget la ad set. Default: true.")
+      is_adset_budget_sharing_enabled: z.boolean().default(true).describe("v24.0+: Permite partajarea bugetului intre ad set-uri.")
     },
-    async ({ campaign_id, name, advantage_audience, daily_budget, age_min, age_max, genders, countries,
-             optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids, pixel_id,
-             end_time, is_adset_budget_sharing_enabled, excluded_audience_ids,
-             publisher_platforms, facebook_positions, instagram_positions,
-             frequency_cap, frequency_cap_period,
-             excluded_interest_ids, excluded_geo_countries, excluded_geo_regions,
-             excluded_geo_cities, excluded_custom_audience_ids }) => {
+    async (args) => {
       try {
+        const {
+          ad_account_id, campaign_id, name, advantage_audience, daily_budget, age_min, age_max,
+          genders, countries, optimization_goal, billing_event, bid_strategy, bid_amount, interest_ids,
+          pixel_id, end_time, is_adset_budget_sharing_enabled,
+          publisher_platforms, facebook_positions, instagram_positions,
+          frequency_cap, frequency_cap_period,
+          excluded_interest_ids, excluded_geo_countries, excluded_geo_regions,
+          excluded_geo_cities, excluded_custom_audience_ids
+        } = args;
+
+        const acct = resolveAccount(ad_account_id);
+        const warnings = [];
+
         const targeting = {
           age_min, age_max, genders,
           geo_locations: { countries },
@@ -354,56 +598,60 @@ function createServer() {
         if (pixel_id && optimization_goal === "OFFSITE_CONVERSIONS") {
           body.promoted_object = { pixel_id, custom_event_type: "LEAD" };
         }
-        // Exclusions — combina toate tipurile de excluderi intr-un singur obiect
+
+        // Exclusions
         const exclusions = {};
-        // Custom audiences exclusion
-        const allExcludedAudiences = [
-          ...(excluded_audience_ids || []).map(id => ({ id })),
-          ...(excluded_custom_audience_ids || []).map(id => ({ id }))
-        ];
-        if (allExcludedAudiences.length) exclusions.custom_audiences = allExcludedAudiences;
-        // Interests exclusion
+        if (excluded_custom_audience_ids?.length) {
+          exclusions.custom_audiences = excluded_custom_audience_ids.map(id => ({ id }));
+        }
         if (excluded_interest_ids?.length) {
           exclusions.interests = excluded_interest_ids.map(id => ({ id }));
         }
-        // Geo exclusions
         const excluded_geo = {};
         if (excluded_geo_countries?.length)  excluded_geo.countries = excluded_geo_countries;
         if (excluded_geo_regions?.length)    excluded_geo.regions   = excluded_geo_regions;
         if (excluded_geo_cities?.length)     excluded_geo.cities    = excluded_geo_cities;
         if (Object.keys(excluded_geo).length) exclusions.geo_locations = excluded_geo;
-        // Apply exclusions if any
         if (Object.keys(exclusions).length) body.targeting.exclusions = exclusions;
+
         // Placements
         if (publisher_platforms?.length) {
           body.targeting.publisher_platforms = publisher_platforms;
           if (facebook_positions?.length)  body.targeting.facebook_positions = facebook_positions;
           if (instagram_positions?.length) body.targeting.instagram_positions = instagram_positions;
         }
-        // Frequency cap — valabil DOAR pentru REACH si IMPRESSIONS (Meta policy)
-        if (frequency_cap && ["REACH","IMPRESSIONS"].includes(optimization_goal)) {
-          body.frequency_control_specs = [{
-            event: "IMPRESSIONS",
-            interval_days: frequency_cap_period === "DAILY" ? 1 : frequency_cap_period === "WEEKLY" ? 7 : 30,
-            max_frequency: Math.min(Math.max(1, frequency_cap), 90)
-          }];
-        } else if (frequency_cap) {
-          // Ignora frequency_cap — incompatibil cu optimization_goal curent
-          // Continuam cu crearea ad set-ului
+
+        // Frequency cap — valabil DOAR pentru REACH si IMPRESSIONS
+        if (frequency_cap) {
+          if (["REACH","IMPRESSIONS"].includes(optimization_goal)) {
+            body.frequency_control_specs = [{
+              event: "IMPRESSIONS",
+              interval_days: frequency_cap_period === "DAILY" ? 1 : frequency_cap_period === "WEEKLY" ? 7 : 30,
+              max_frequency: Math.min(Math.max(1, frequency_cap), 90)
+            }];
+          } else {
+            warnings.push(`⚠ frequency_cap IGNORAT — compatibil doar cu optimization_goal=REACH sau IMPRESSIONS (actual: ${optimization_goal}).`);
+          }
         }
-        const d = await meta(`/act_${ACCOUNT}/adsets`, "POST", body);
+
+        const d = await meta(`/act_${acct}/adsets`, "POST", body);
         const bStr = daily_budget ? `${(daily_budget/100).toFixed(2)}$/zi` : "din campanie";
-        return ok(`Ad Set creat!\nID: ${d.id}\nNume: ${name}\nBuget: ${bStr}\nAudienta: ${advantage_audience===0?"Manual":"Advantage+ AI"}\nStatus: PAUSED\n\nPasul urmator: upload_image sau create_creative cu adset_id="${d.id}"`);
+        const warnBlock = warnings.length ? `\n\n${warnings.join("\n")}` : "";
+        return ok(`Ad Set creat!\nID: ${d.id}\nNume: ${name}\nBuget: ${bStr}\nAudienta: ${advantage_audience===0?"Manual":"Advantage+ AI"}\nStatus: PAUSED${warnBlock}\n\nPasul urmator: upload_image sau create_creative cu adset_id="${d.id}"`);
       } catch (e) { return err(e); }
     }
   );
 
   server.tool("upload_image",
     "Pas 3a/5: Uploadeaza imagine din URL. Returneaza image_hash pentru create_creative.\nGoogle Drive: Share > Anyone with link → https://drive.google.com/uc?export=download&id=FILE_ID",
-    { image_url: z.string().url().describe("URL public direct al imaginii") },
-    async ({ image_url }) => {
+    {
+      ...accountParam,
+      image_url: z.string().url().describe("URL public direct al imaginii")
+    },
+    async ({ ad_account_id, image_url }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/adimages`, "POST", { url: image_url });
+        const acct = resolveAccount(ad_account_id);
+        const d = await meta(`/act_${acct}/adimages`, "POST", { url: image_url });
         const img = Object.values(d.images || {})[0];
         if (!img) throw new Error("Upload esuat. Verifica ca URL-ul returneaza direct imaginea si nu o pagina HTML.");
         return ok(`Imagine uploadata!\nHash: ${img.hash}\nDimensiune: ${img.width}x${img.height}px\n\nPasul urmator: create_creative cu image_hash="${img.hash}"`);
@@ -414,12 +662,14 @@ function createServer() {
   server.tool("upload_video",
     "Pas 3b/5: Uploadeaza video din URL. Returneaza video_id pentru create_video_creative.",
     {
+      ...accountParam,
       video_url: z.string().url().describe("URL public direct al fisierului video (MP4, max 4GB)"),
       title: z.string().default("Video Ad")
     },
-    async ({ video_url, title }) => {
+    async ({ ad_account_id, video_url, title }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/advideos`, "POST", { file_url: video_url, title });
+        const acct = resolveAccount(ad_account_id);
+        const d = await meta(`/act_${acct}/advideos`, "POST", { file_url: video_url, title });
         return ok(`Video uploadat!\nID: ${d.id}\nTitlu: ${title}\n\nPasul urmator: create_video_creative cu video_id="${d.id}"`);
       } catch (e) { return err(e); }
     }
@@ -428,6 +678,7 @@ function createServer() {
   server.tool("create_creative",
     "Pas 4a/5: Creeaza creative cu imagine. Returneaza creative_id pentru create_ad.",
     {
+      ...accountParam,
       name: z.string(),
       page_id: z.string().describe("ID pagina Facebook din get_pages"),
       image_hash: z.string().describe("Hash din upload_image sau list_images"),
@@ -438,12 +689,13 @@ function createServer() {
       cta_type: z.enum(["LEARN_MORE","SHOP_NOW","SIGN_UP","CONTACT_US","GET_QUOTE","APPLY_NOW","DOWNLOAD","SUBSCRIBE","GET_OFFER","WATCH_MORE"]).default("LEARN_MORE"),
       instagram_actor_id: z.string().optional().describe("ID cont Instagram din list_instagram_accounts")
     },
-    async ({ name, page_id, image_hash, message, headline, description, link_url, cta_type, instagram_actor_id }) => {
+    async ({ ad_account_id, name, page_id, image_hash, message, headline, description, link_url, cta_type, instagram_actor_id }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const link_data = { image_hash, link: link_url, message, name: headline, description: description||"", call_to_action: { type: cta_type, value: { link: link_url } } };
         const spec = { page_id, link_data };
         if (instagram_actor_id) spec.instagram_actor_id = instagram_actor_id;
-        const d = await meta(`/act_${ACCOUNT}/adcreatives`, "POST", { name, object_story_spec: spec });
+        const d = await meta(`/act_${acct}/adcreatives`, "POST", { name, object_story_spec: spec });
         return ok(`Creative creat!\nID: ${d.id}\nNume: ${name}\n\nPasul urmator: create_ad cu creative_id="${d.id}"`);
       } catch (e) { return err(e); }
     }
@@ -452,6 +704,7 @@ function createServer() {
   server.tool("create_video_creative",
     "Pas 4b/5: Creeaza creative cu video. Thumbnail preluat automat din video daca nu e specificat.",
     {
+      ...accountParam,
       name: z.string(),
       page_id: z.string().describe("ID pagina Facebook din get_pages"),
       video_id: z.string().describe("ID video din upload_video"),
@@ -461,8 +714,9 @@ function createServer() {
       cta_type: z.enum(["LEARN_MORE","SHOP_NOW","SIGN_UP","CONTACT_US","WATCH_MORE","DOWNLOAD"]).default("LEARN_MORE"),
       thumbnail_url: z.string().url().optional().describe("URL thumbnail custom. Daca lipseste, serverul il preia automat din video.")
     },
-    async ({ name, page_id, video_id, message, headline, link_url, cta_type, thumbnail_url }) => {
+    async ({ ad_account_id, name, page_id, video_id, message, headline, link_url, cta_type, thumbnail_url }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         let thumb = thumbnail_url;
         if (!thumb) {
           try {
@@ -474,7 +728,7 @@ function createServer() {
         }
         const video_data = { video_id, message, title: headline, call_to_action: { type: cta_type, value: { link: link_url } } };
         if (thumb) video_data.image_url = thumb;
-        const d = await meta(`/act_${ACCOUNT}/adcreatives`, "POST", { name, object_story_spec: { page_id, video_data } });
+        const d = await meta(`/act_${acct}/adcreatives`, "POST", { name, object_story_spec: { page_id, video_data } });
         const tInfo = thumb ? (thumbnail_url ? "thumbnail custom" : "thumbnail auto din video") : "fara thumbnail";
         return ok(`Creative video creat!\nID: ${d.id}\nThumbnail: ${tInfo}\n\nPasul urmator: create_ad cu creative_id="${d.id}"`);
       } catch (e) { return err(e); }
@@ -484,6 +738,7 @@ function createServer() {
   server.tool("create_carousel_creative",
     "Pas 4c/5: Creeaza creative carousel (2-10 carduri). Ideal pentru mai multe produse.",
     {
+      ...accountParam,
       name: z.string(),
       page_id: z.string().describe("ID pagina Facebook din get_pages"),
       message: z.string().max(500),
@@ -495,13 +750,14 @@ function createServer() {
         link_url: z.string().url()
       })).min(2).max(10).describe("Cardurile carousel (minim 2, maxim 10)")
     },
-    async ({ name, page_id, message, cta_type, cards }) => {
+    async ({ ad_account_id, name, page_id, message, cta_type, cards }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const child_attachments = cards.map(c => ({
           link: c.link_url, image_hash: c.image_hash, name: c.headline,
           description: c.description||"", call_to_action: { type: cta_type, value: { link: c.link_url } }
         }));
-        const d = await meta(`/act_${ACCOUNT}/adcreatives`, "POST", { name, object_story_spec: { page_id, link_data: { message, link: cards[0].link_url, child_attachments, multi_share_optimized: true } } });
+        const d = await meta(`/act_${acct}/adcreatives`, "POST", { name, object_story_spec: { page_id, link_data: { message, link: cards[0].link_url, child_attachments, multi_share_optimized: true } } });
         return ok(`Creative carousel creat!\nID: ${d.id}\nCarduri: ${cards.length}\n\nPasul urmator: create_ad cu creative_id="${d.id}"`);
       } catch (e) { return err(e); }
     }
@@ -510,15 +766,17 @@ function createServer() {
   server.tool("create_ad",
     "Pas 5/5: Creeaza Ad-ul final — leaga Ad Set-ul cu Creative-ul. Campania ramane PAUSED pana o activezi manual.",
     {
+      ...accountParam,
       adset_id: z.string().describe("ID Ad Set din create_adset"),
       creative_id: z.string().describe("ID creative din create_creative / create_video_creative / create_carousel_creative"),
       name: z.string().describe("Numele Ad-ului"),
-      multi_advertiser_ads: z.boolean().default(true).describe("Multi-advertiser ads: true=activat (Meta afiseaza reclama alaturi de alte reclame similare), false=dezactivat (reclama apare singura). Dezactiveaza daca vrei control complet asupra plasamentului."),
+      multi_advertiser_ads: z.boolean().default(true).describe("Multi-advertiser ads: true=activat, false=dezactivat (control complet asupra plasamentului)."),
       url_tags: z.string().optional().describe("Parametri UTM pentru tracking (ex: 'utm_source=facebook&utm_medium=paid&utm_campaign=test')"),
       conversion_domain: z.string().optional().describe("Domeniul de conversie (ex: 'exemplu.ro'). Recomandat pentru campanii cu pixel.")
     },
-    async ({ adset_id, creative_id, name, multi_advertiser_ads, url_tags, conversion_domain }) => {
+    async ({ ad_account_id, adset_id, creative_id, name, multi_advertiser_ads, url_tags, conversion_domain }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const body = {
           adset_id,
           creative: { creative_id },
@@ -528,7 +786,7 @@ function createServer() {
         };
         if (url_tags)          body.creative = { ...body.creative, url_tags };
         if (conversion_domain) body.conversion_domain = conversion_domain;
-        const d = await meta(`/act_${ACCOUNT}/ads`, "POST", body);
+        const d = await meta(`/act_${acct}/ads`, "POST", body);
         return ok(`Ad creat cu succes!\nID: ${d.id}\nNume: ${name}\nStatus: PAUSED\nMulti-advertiser: ${multi_advertiser_ads ? "activat" : "dezactivat"}\n\nActiveaza cu update_campaign_status cand esti gata sa difuzezi.`);
       } catch (e) { return err(e); }
     }
@@ -566,14 +824,14 @@ function createServer() {
       daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI USD (ex: 2000=$20)"),
       bid_amount: z.number().optional().describe("Noul bid in CENTI USD"),
       end_time: z.string().optional().describe("Data de sfarsit ISO 8601"),
-      countries: z.array(z.string()).optional().describe("Inlocuieste targetingul geografic (ex: ['RO','MD'])"),
+      countries: z.array(z.string()).optional().describe("Inlocuieste targetingul geografic"),
       age_min: z.number().optional().describe("Noua varsta minima (18-65)"),
       age_max: z.number().optional().describe("Noua varsta maxima (18-65)"),
       genders: z.array(z.number()).optional().describe("1=Barbati 2=Femei [1,2]=Ambele"),
-      interest_ids: z.array(z.string()).optional().describe("Inlocuieste interesele cu aceste ID-uri din search_interests"),
+      interest_ids: z.array(z.string()).optional().describe("Inlocuieste interesele cu aceste ID-uri"),
       excluded_interest_ids: z.array(z.string()).optional().describe("Interese de EXCLUS din targeting"),
-      excluded_geo_countries: z.array(z.string()).optional().describe("Tari de EXCLUS (coduri ISO 2)"),
-      excluded_custom_audience_ids: z.array(z.string()).optional().describe("Audionte custom de EXCLUS (ID-uri din list_custom_audiences)")
+      excluded_geo_countries: z.array(z.string()).optional().describe("Tari de EXCLUS"),
+      excluded_custom_audience_ids: z.array(z.string()).optional().describe("Audionte custom de EXCLUS")
     },
     async ({ adset_id, status, name, daily_budget, bid_amount, end_time, countries, age_min, age_max, genders, interest_ids, excluded_interest_ids, excluded_geo_countries, excluded_custom_audience_ids }) => {
       try {
@@ -583,10 +841,11 @@ function createServer() {
         if (daily_budget) body.daily_budget = daily_budget;
         if (bid_amount)   body.bid_amount = bid_amount;
         if (end_time)     body.end_time = end_time;
-        if (countries || age_min !== undefined || age_max !== undefined || genders || interest_ids) {
+        if (countries || age_min !== undefined || age_max !== undefined || genders || interest_ids ||
+            excluded_interest_ids || excluded_geo_countries || excluded_custom_audience_ids) {
           const current = await meta(`/${adset_id}?fields=targeting`);
           const targeting = { ...(current.targeting || {}) };
-          // Preserva targeting_automation existent (advantage_audience)
+          // Preserva targeting_automation existent
           if (!targeting.targeting_automation && current.targeting?.targeting_automation) {
             targeting.targeting_automation = current.targeting.targeting_automation;
           }
@@ -595,9 +854,9 @@ function createServer() {
           if (age_max !== undefined) targeting.age_max = age_max;
           if (genders)               targeting.genders = genders;
           if (interest_ids?.length)  targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
-          // Exclusions in update
+          // Exclusions
           const excl = { ...(targeting.exclusions || {}) };
-          if (excluded_interest_ids?.length)       excl.interests        = excluded_interest_ids.map(id => ({ id }));
+          if (excluded_interest_ids?.length)        excl.interests        = excluded_interest_ids.map(id => ({ id }));
           if (excluded_geo_countries?.length)       excl.geo_locations    = { ...(excl.geo_locations||{}), countries: excluded_geo_countries };
           if (excluded_custom_audience_ids?.length) excl.custom_audiences = excluded_custom_audience_ids.map(id => ({ id }));
           if (Object.keys(excl).length) targeting.exclusions = excl;
@@ -622,63 +881,67 @@ function createServer() {
   );
 
   server.tool("update_ad",
-    "Modifica un Ad existent: status, nume, creative, multi-advertiser ads si alte optiuni",
+    "Modifica un Ad existent: status, nume, multi-advertiser ads, conversion domain, URL tags. NOTA: Meta API nu permite schimbarea creative-ului unui ad existent — pentru creative nou, creeaza ad nou cu create_ad.",
     {
       ad_id: z.string().describe("ID-ul Ad-ului de modificat"),
       status: z.enum(["ACTIVE","PAUSED"]).optional().describe("Activeaza sau pauzeaza ad-ul"),
       name: z.string().optional().describe("Noul nume al Ad-ului"),
-      creative_id: z.string().optional().describe("ID-ul noului creative. Inlocuieste creative-ul existent."),
-      multi_advertiser_ads: z.boolean().optional().describe("Multi-advertiser ads: true=activat, false=dezactivat. Dezactiveaza daca vrei reclama sa apara singura, fara reclame similare alaturi."),
-      conversion_domain: z.string().optional().describe("Actualizeaza domeniul de conversie (ex: 'exemplu.ro')")
+      multi_advertiser_ads: z.boolean().optional().describe("Multi-advertiser ads: true=activat, false=dezactivat."),
+      conversion_domain: z.string().optional().describe("Actualizeaza domeniul de conversie (ex: 'exemplu.ro')"),
+      url_tags: z.string().optional().describe("Parametri UTM pentru tracking")
     },
-    async ({ ad_id, status, name, creative_id, multi_advertiser_ads, conversion_domain }) => {
+    async ({ ad_id, status, name, multi_advertiser_ads, conversion_domain, url_tags }) => {
       try {
         const body = {};
         if (status)      body.status = status;
         if (name)        body.name = name;
-        if (creative_id) body.creative = { creative_id };
         if (multi_advertiser_ads !== undefined) body.multi_advertiser_eligibility = multi_advertiser_ads ? "eligible" : "not_eligible";
         if (conversion_domain) body.conversion_domain = conversion_domain;
+        if (url_tags) body.url_tags = url_tags;
         if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
         await meta(`/${ad_id}`, "POST", body);
-        const changes = Object.keys(body).map(k => {
-          if (k === "multi_advertiser_eligibility") return `multi_advertiser: ${body[k]}`;
-          return k;
-        }).join(", ");
+        const changes = Object.keys(body).map(k => k === "multi_advertiser_eligibility" ? `multi_advertiser: ${body[k]}` : k).join(", ");
         return ok(`Ad ${ad_id} actualizat.\nCampuri modificate: ${changes}`);
       } catch (e) { return err(e); }
     }
   );
 
   server.tool("duplicate_campaign",
-    "Duplica o campanie existenta recreand-o manual cu aceleasi setari. Ad Set-urile si Ad-urile trebuie recreate separat.",
+    "Duplica o campanie existenta recreand-o cu aceleasi setari. Raporteaza erorile de copiere (nu le ascunde).",
     {
+      ...accountParam,
       campaign_id: z.string().describe("ID campanie de copiat"),
       new_name: z.string().describe("Numele noii campanii")
     },
-    async ({ campaign_id, new_name }) => {
+    async ({ ad_account_id, campaign_id, new_name }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const orig = await meta(`/${campaign_id}?fields=name,objective,daily_budget,lifetime_budget,special_ad_categories,stop_time`);
         const body = { name: new_name, objective: orig.objective, status: "PAUSED", special_ad_categories: orig.special_ad_categories||[] };
         if (orig.daily_budget)    body.daily_budget = parseInt(orig.daily_budget);
         if (orig.lifetime_budget) body.lifetime_budget = parseInt(orig.lifetime_budget);
         if (orig.stop_time)       body.stop_time = orig.stop_time;
-        const d = await meta(`/act_${ACCOUNT}/campaigns`, "POST", body);
-        const adsets = await meta(`/${campaign_id}/adsets?fields=name,daily_budget,targeting,optimization_goal,billing_event,bid_strategy&limit=50`);
+        const d = await meta(`/act_${acct}/campaigns`, "POST", body);
+
+        const adsetsResp = await meta(`/${campaign_id}/adsets?fields=name,daily_budget,targeting,optimization_goal,billing_event,bid_strategy&limit=50`);
+        const adsets = adsetsResp.data || [];
         let copied = 0;
-        for (const as of (adsets.data||[])) {
+        const failures = [];
+        for (const as of adsets) {
           try {
-            // Asigura ca targeting_automation e prezent (necesar Meta v25)
             const tgt = { ...(as.targeting || {}) };
             if (!tgt.targeting_automation) tgt.targeting_automation = { advantage_audience: 0 };
             const ab = { campaign_id: d.id, name: as.name, targeting: tgt, optimization_goal: as.optimization_goal, billing_event: as.billing_event, status: "PAUSED" };
             if (as.bid_strategy) ab.bid_strategy = as.bid_strategy;
             if (as.daily_budget) ab.daily_budget = parseInt(as.daily_budget);
-            await meta(`/act_${ACCOUNT}/adsets`, "POST", ab);
+            await meta(`/act_${acct}/adsets`, "POST", ab);
             copied++;
-          } catch {}
+          } catch (e) {
+            failures.push(`  ✗ ${as.name}: ${e.message}`);
+          }
         }
-        return ok(`Campanie duplicata!\nID nou: ${d.id}\nNume: ${new_name}\nAd Sets copiate: ${copied}/${(adsets.data||[]).length}`);
+        const failBlock = failures.length ? `\n\nErori la copiere:\n${failures.join("\n")}` : "";
+        return ok(`Campanie duplicata!\nID nou: ${d.id}\nNume: ${new_name}\nAd Sets copiate: ${copied}/${adsets.length}${failBlock}`);
       } catch (e) { return err(e); }
     }
   );
@@ -686,7 +949,11 @@ function createServer() {
   // ── TARGETING ─────────────────────────────────────────────────────────────
   server.tool("search_interests",
     "Cauta interese pentru targeting. NOTA: Din oct 2025 interesele sunt consolidate in categorii mai largi. Interesele vechi nu functioneaza din ian 2026.",
-    { query: z.string().describe("Termen de cautat (ex: fitness, imobiliare, antreprenoriat)"), limit: z.number().default(15), locale: z.string().default("en_US").describe("Limba rezultatelor (en_US pentru engleza, ro_RO pentru romana)") },
+    {
+      query: z.string().describe("Termen de cautat (ex: fitness, imobiliare, antreprenoriat)"),
+      limit: z.number().default(15),
+      locale: z.string().default("en_US").describe("Limba rezultatelor (en_US pentru engleza, ro_RO pentru romana)")
+    },
     async ({ query, limit, locale }) => {
       try {
         const d = await meta(`/search?type=adinterest&q=${encodeURIComponent(query)}&limit=${limit}&locale=${locale}`);
@@ -717,19 +984,22 @@ function createServer() {
 
   server.tool("list_custom_audiences",
     "Listeaza audientele personalizate si lookalike din cont",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/customaudiences?fields=id,name,subtype,approximate_count_lower_bound,approximate_count_upper_bound,delivery_status&limit=50`);
-        const a = d.data || [];
-        if (!a.length) return ok("Nu exista audionte personalizate.");
-        const lines = a.map(x => {
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(
+          `/act_${acct}/customaudiences?fields=id,name,subtype,approximate_count_lower_bound,approximate_count_upper_bound,delivery_status&limit=50`,
+          { maxItems: 200 }
+        );
+        if (!data.length) return ok("Nu exista audionte personalizate.");
+        const lines = data.map(x => {
           const low  = x.approximate_count_lower_bound ? parseInt(x.approximate_count_lower_bound).toLocaleString() : "?";
           const high = x.approximate_count_upper_bound ? parseInt(x.approximate_count_upper_bound).toLocaleString() : "?";
           const size = low === "?" ? "in procesare" : `${low} - ${high}`;
           return `ID: ${x.id} | ${x.name} | ${x.subtype} | ~${size} persoane`;
         });
-        return ok(`Audionte (${a.length}):\n${lines.join("\n")}`);
+        return ok(`Audionte (${data.length}):\n${lines.join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -737,14 +1007,16 @@ function createServer() {
   server.tool("create_lookalike_audience",
     "Creeaza o audienta Lookalike bazata pe o audienta existenta.",
     {
+      ...accountParam,
       source_audience_id: z.string().describe("ID audienta sursa din list_custom_audiences"),
       name: z.string(),
       country: z.string().default("RO").describe("Codul tarii (ex: RO, MD, US)"),
       ratio: z.number().min(0.01).max(0.20).default(0.02).describe("Procentul din populatie (0.01=1%, 0.20=20%). Mai mic = mai similar.")
     },
-    async ({ source_audience_id, name, country, ratio }) => {
+    async ({ ad_account_id, source_audience_id, name, country, ratio }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", { name, subtype: "LOOKALIKE", origin_audience_id: source_audience_id, lookalike_spec: { type: "similarity", ratio, country } });
+        const acct = resolveAccount(ad_account_id);
+        const d = await meta(`/act_${acct}/customaudiences`, "POST", { name, subtype: "LOOKALIKE", origin_audience_id: source_audience_id, lookalike_spec: { type: "similarity", ratio, country } });
         return ok(`Lookalike creata!\nID: ${d.id}\nNume: ${name}\nTara: ${country} | Ratio: ${(ratio*100).toFixed(0)}%`);
       } catch (e) { return err(e); }
     }
@@ -756,10 +1028,12 @@ function createServer() {
     { page_id: z.string().describe("ID pagina Facebook din get_pages") },
     async ({ page_id }) => {
       try {
-        const d = await meta(`/${page_id}/leadgen_forms?fields=id,name,status,leads_count,created_time&limit=25`);
-        const f = d.data || [];
-        if (!f.length) return ok("Nu exista formulare Lead Gen pe aceasta pagina.");
-        return ok(`Formulare (${f.length}):\n${f.map(x=>`ID: ${x.id} | ${x.name} | ${x.status} | ${x.leads_count||0} leads`).join("\n")}`);
+        const { data } = await metaPaginated(
+          `/${page_id}/leadgen_forms?fields=id,name,status,leads_count,created_time&limit=25`,
+          { maxItems: 100 }
+        );
+        if (!data.length) return ok("Nu exista formulare Lead Gen pe aceasta pagina.");
+        return ok(`Formulare (${data.length}):\n${data.map(x=>`ID: ${x.id} | ${x.name} | ${x.status} | ${x.leads_count||0} leads`).join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -768,14 +1042,16 @@ function createServer() {
     "Descarca lead-urile dintr-un formular Lead Gen.",
     {
       form_id: z.string().describe("ID formular din list_lead_forms"),
-      limit: z.number().default(50).describe("Numar maxim de lead-uri (max 100)")
+      limit: z.number().default(50).describe("Numar maxim de lead-uri (max 500 via paginare)")
     },
     async ({ form_id, limit }) => {
       try {
-        const d = await meta(`/${form_id}/leads?fields=id,created_time,field_data&limit=${Math.min(limit,100)}`);
-        const leads = d.data || [];
-        if (!leads.length) return ok("Niciun lead gasit.");
-        return ok(`Lead-uri (${leads.length}):\n${leads.map(l=>{
+        const { data } = await metaPaginated(
+          `/${form_id}/leads?fields=id,created_time,field_data&limit=100`,
+          { maxItems: Math.min(limit, 500) }
+        );
+        if (!data.length) return ok("Niciun lead gasit.");
+        return ok(`Lead-uri (${data.length}):\n${data.map(l=>{
           const date = new Date(l.created_time).toLocaleString("ro-RO");
           const fields = (l.field_data||[]).map(f=>`${f.name}: ${(f.values||[]).join(", ")}`).join(" | ");
           return `${date} | ${fields}`;
@@ -784,11 +1060,11 @@ function createServer() {
     }
   );
 
-
   // ── PLASAMENTE & REACH ───────────────────────────────────────────────────
   server.tool("get_reach_estimate",
     "Estimeaza reach-ul si CPM inainte de a crea campania. Verifica daca audienta e prea mica sau prea mare.",
     {
+      ...accountParam,
       countries: z.array(z.string()).default(["RO"]).describe("Coduri ISO 2"),
       age_min: z.number().default(18),
       age_max: z.number().default(65),
@@ -797,12 +1073,13 @@ function createServer() {
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests"),
       daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD pentru estimare cost")
     },
-    async ({ countries, age_min, age_max, genders, optimization_goal, interest_ids, daily_budget }) => {
+    async ({ ad_account_id, countries, age_min, age_max, genders, optimization_goal, interest_ids, daily_budget }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const targeting = { age_min, age_max, genders, geo_locations: { countries } };
         if (interest_ids?.length) targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
         const tsEnc = encodeURIComponent(JSON.stringify(targeting));
-        let url = `/act_${ACCOUNT}/reachestimate?targeting_spec=${tsEnc}&optimization_goal=${optimization_goal}&currency=USD`;
+        let url = `/act_${acct}/reachestimate?targeting_spec=${tsEnc}&optimization_goal=${optimization_goal}&currency=USD`;
         if (daily_budget) url += `&daily_budget=${daily_budget}`;
         const d = await meta(url);
         const users = (d.users || 0).toLocaleString();
@@ -816,6 +1093,7 @@ function createServer() {
   server.tool("get_ad_preview",
     "Previzualizeaza cum arata o reclama inainte de publicare pe diferite plasamente",
     {
+      ...accountParam,
       ad_id: z.string().optional().describe("ID-ul unui Ad existent"),
       creative_id: z.string().optional().describe("ID-ul unui Creative (alternativa la ad_id)"),
       ad_format: z.enum([
@@ -829,15 +1107,16 @@ function createServer() {
         "INSTAGRAM_REELS"
       ]).default("MOBILE_FEED_STANDARD").describe("Formatul de preview")
     },
-    async ({ ad_id, creative_id, ad_format }) => {
+    async ({ ad_account_id, ad_id, creative_id, ad_format }) => {
       try {
         if (!ad_id && !creative_id) throw new Error("Specifica fie ad_id fie creative_id");
         let d;
         if (ad_id) {
           d = await meta(`/${ad_id}/previews?ad_format=${ad_format}`);
         } else {
+          const acct = resolveAccount(ad_account_id);
           const creativeEnc = encodeURIComponent(JSON.stringify({ creative_id }));
-          d = await meta(`/act_${ACCOUNT}/generatepreviews?creative=${creativeEnc}&ad_format=${ad_format}`);
+          d = await meta(`/act_${acct}/generatepreviews?creative=${creativeEnc}&ad_format=${ad_format}`);
         }
         const preview = (d.data||[])[0];
         if (!preview) return ok("Niciun preview disponibil.");
@@ -850,32 +1129,20 @@ function createServer() {
   server.tool("create_rule",
     "Creeaza o regula automata Meta: pauzeaza cand CPL > prag, creste buget cand ROAS > target, etc.",
     {
+      ...accountParam,
       name: z.string().describe("Numele regulii"),
       entity_type: z.enum(["CAMPAIGN","ADSET","AD"]).default("ADSET").describe("Tipul entitatii la care se aplica regula"),
-      action: z.enum([
-        "PAUSE",
-        "UNPAUSE",
-        "INCREASE_BUDGET",
-        "DECREASE_BUDGET",
-        "SEND_NOTIFICATION"
-      ]).describe("Actiunea care se executa"),
-      metric: z.enum([
-        "COST_PER_RESULT",
-        "ROAS",
-        "CTR",
-        "SPEND",
-        "IMPRESSIONS",
-        "FREQUENCY",
-        "CPM",
-        "CPC"
-      ]).describe("Metrica monitorizata"),
+      action: z.enum(["PAUSE","UNPAUSE","INCREASE_BUDGET","DECREASE_BUDGET","SEND_NOTIFICATION"]).describe("Actiunea care se executa"),
+      metric: z.enum(["COST_PER_RESULT","ROAS","CTR","SPEND","IMPRESSIONS","FREQUENCY","CPM","CPC"]).describe("Metrica monitorizata"),
       operator: z.enum(["GREATER_THAN","LESS_THAN"]).describe("Operatorul de comparatie"),
       threshold: z.number().describe("Pragul declansator (ex: 5 pentru CPL > $5, 2 pentru ROAS > 2)"),
-      budget_change_percent: z.number().optional().describe("Procentul cu care se modifica bugetul (ex: 20 = +20%). Necesar pentru INCREASE_BUDGET/DECREASE_BUDGET."),
-      schedule: z.enum(["DAILY","HOURLY","SEMI_HOURLY"]).default("DAILY").describe("Frecventa de evaluare a regulii")
+      budget_change_percent: z.number().optional().describe("Procentul cu care se modifica bugetul. Necesar pentru INCREASE_BUDGET/DECREASE_BUDGET."),
+      schedule: z.enum(["DAILY","HOURLY","SEMI_HOURLY"]).default("DAILY").describe("Frecventa de evaluare a regulii"),
+      time_window: z.enum(["LAST_3_DAYS","LAST_7_DAYS","LAST_14_DAYS","LAST_30_DAYS","LIFETIME"]).default("LAST_7_DAYS").describe("Fereastra de timp pentru evaluarea metricii")
     },
-    async ({ name, entity_type, action, metric, operator, threshold, budget_change_percent, schedule }) => {
+    async ({ ad_account_id, name, entity_type, action, metric, operator, threshold, budget_change_percent, schedule, time_window }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const metric_map = {
           COST_PER_RESULT: "cost_per_result",
           ROAS: "purchase_roas",
@@ -887,6 +1154,14 @@ function createServer() {
           CPC: "cpc"
         };
 
+        const time_preset_map = {
+          LAST_3_DAYS: "LAST_3_DAYS",
+          LAST_7_DAYS: "LAST_7_DAYS",
+          LAST_14_DAYS: "LAST_14_DAYS",
+          LAST_30_DAYS: "LAST_30_DAYS",
+          LIFETIME: "LIFETIME"
+        };
+
         const evaluation_spec = {
           evaluation_type: "SCHEDULE",
           filters: [{
@@ -894,7 +1169,7 @@ function createServer() {
             value: [threshold],
             operator
           }],
-          time_preset: "LIFETIME"
+          time_preset: time_preset_map[time_window]
         };
 
         const execution_spec = { execution_type: action };
@@ -915,21 +1190,24 @@ function createServer() {
           status: "ENABLED"
         };
 
-        const d = await meta(`/act_${ACCOUNT}/adrules`, "POST", body);
-        return ok(`Regula creata!\nID: ${d.id}\nNume: ${name}\nActiune: ${action} cand ${metric} ${operator.replace("_"," ")} ${threshold}\nEvaluare: ${schedule}`);
+        const d = await meta(`/act_${acct}/adrules_library`, "POST", body);
+        return ok(`Regula creata!\nID: ${d.id}\nNume: ${name}\nActiune: ${action} cand ${metric} ${operator.replace("_"," ")} ${threshold}\nFereastra: ${time_window}\nEvaluare: ${schedule}`);
       } catch (e) { return err(e); }
     }
   );
 
   server.tool("list_rules",
     "Listeaza regulile automate active din cont",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/adrules?fields=id,name,status,evaluation_spec,execution_spec&limit=50`);
-        const rules = d.data || [];
-        if (!rules.length) return ok("Nu exista reguli automate.");
-        return ok(`Reguli automate (${rules.length}):\n${rules.map(r => `ID: ${r.id} | ${r.name} | ${r.status}`).join("\n")}`);
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(
+          `/act_${acct}/adrules_library?fields=id,name,status,evaluation_spec,execution_spec&limit=50`,
+          { maxItems: 200 }
+        );
+        if (!data.length) return ok("Nu exista reguli automate.");
+        return ok(`Reguli automate (${data.length}):\n${data.map(r => `ID: ${r.id} | ${r.name} | ${r.status}`).join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -957,6 +1235,7 @@ function createServer() {
   server.tool("create_experiment",
     "Creeaza un A/B test intre doua campanii pentru a compara audienta, creative sau strategie de bidding",
     {
+      ...accountParam,
       name: z.string().describe("Numele experimentului"),
       campaign_id_a: z.string().describe("ID campanie varianta A (de control)"),
       campaign_id_b: z.string().describe("ID campanie varianta B (de test)"),
@@ -964,8 +1243,9 @@ function createServer() {
       split_percent: z.number().min(10).max(50).default(50).describe("Procentul de audienta pentru varianta B (10-50%)"),
       end_time: z.string().describe("Data de sfarsit ISO 8601. Recomandat: minim 7 zile pentru semnificatie statistica.")
     },
-    async ({ name, campaign_id_a, campaign_id_b, objective, split_percent, end_time }) => {
+    async ({ ad_account_id, name, campaign_id_a, campaign_id_b, objective, split_percent, end_time }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const body = {
           name,
           cells: JSON.stringify([
@@ -975,7 +1255,7 @@ function createServer() {
           objective,
           end_time
         };
-        const d = await meta(`/act_${ACCOUNT}/abtests`, "POST", body);
+        const d = await meta(`/act_${acct}/adstudies`, "POST", body);
         return ok(`Experiment A/B creat!\nID: ${d.id}\nNume: ${name}\nSplit: ${100-split_percent}% varianta A / ${split_percent}% varianta B\nSfarsit: ${end_time}`);
       } catch (e) { return err(e); }
     }
@@ -986,7 +1266,7 @@ function createServer() {
     { experiment_id: z.string().describe("ID-ul experimentului din create_experiment") },
     async ({ experiment_id }) => {
       try {
-        const d = await meta(`/${experiment_id}?fields=id,name,status,cells,end_time,insights`);
+        const d = await meta(`/${experiment_id}?fields=id,name,description,status,cells,start_time,end_time,results`);
         return json(d);
       } catch (e) { return err(e); }
     }
@@ -995,13 +1275,16 @@ function createServer() {
   // ── CONVERSII & CALITATE ──────────────────────────────────────────────────
   server.tool("list_custom_conversions",
     "Listeaza evenimentele de conversie din pixel. Necesar pentru a seta obiective specifice per campanie.",
-    {},
-    async () => {
+    { ...accountParam },
+    async ({ ad_account_id }) => {
       try {
-        const d = await meta(`/act_${ACCOUNT}/customconversions?fields=id,name,event_source_type,custom_event_type,rule,pixel&limit=50`);
-        const cvs = d.data || [];
-        if (!cvs.length) return ok("Nu exista custom conversions. Creeaza-le in Meta Events Manager.");
-        return ok(`Custom Conversions (${cvs.length}):\n${cvs.map(c => `ID: ${c.id} | ${c.name} | ${c.custom_event_type || c.event_source_type}`).join("\n")}`);
+        const acct = resolveAccount(ad_account_id);
+        const { data } = await metaPaginated(
+          `/act_${acct}/customconversions?fields=id,name,event_source_type,custom_event_type,rule,pixel&limit=50`,
+          { maxItems: 200 }
+        );
+        if (!data.length) return ok("Nu exista custom conversions. Creeaza-le in Meta Events Manager.");
+        return ok(`Custom Conversions (${data.length}):\n${data.map(c => `ID: ${c.id} | ${c.name} | ${c.custom_event_type || c.event_source_type}`).join("\n")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -1025,7 +1308,7 @@ function createServer() {
             if (daily_budget) body.daily_budget = daily_budget;
             await meta(`/${id}`, "POST", body);
             results.success.push(id);
-            await new Promise(r => setTimeout(r, 200)); // rate limit protection
+            await new Promise(r => setTimeout(r, 200));
           } catch (e) {
             results.failed.push(`${id}: ${e.message}`);
           }
@@ -1053,7 +1336,7 @@ function createServer() {
             if (daily_budget) body.daily_budget = daily_budget;
             await meta(`/${id}`, "POST", body);
             results.success.push(id);
-            await new Promise(r => setTimeout(r, 200)); // rate limit protection
+            await new Promise(r => setTimeout(r, 200));
           } catch (e) {
             results.failed.push(`${id}: ${e.message}`);
           }
@@ -1063,32 +1346,21 @@ function createServer() {
     }
   );
 
-
   // ── AUDIENTA RETARGETING ─────────────────────────────────────────────────
-
   server.tool("create_website_audience",
     "Creeaza audienta din vizitatori website (pixel-based). Tipul cel mai eficient de retargeting.",
     {
+      ...accountParam,
       name: z.string().describe("Numele audientei (ex: 'Vizitatori site 30 zile')"),
       pixel_id: z.string().describe("ID-ul pixelului Meta din list_pixels"),
-      retention_days: z.number().min(1).max(180).default(30).describe("Perioada de retentie in zile (1-180). Ex: 30 = persoanele care au vizitat site-ul in ultimele 30 zile."),
-      event_name: z.enum([
-        "PageView",
-        "ViewContent",
-        "AddToCart",
-        "InitiateCheckout",
-        "Purchase",
-        "Lead",
-        "CompleteRegistration",
-        "Search",
-        "Contact",
-        "SubmitApplication"
-      ]).default("PageView").describe("Evenimentul pixel pe care se bazeaza audienta. PageView = toti vizitatorii, Purchase = cumparatori, Lead = persoane care au completat un formular."),
-      url_filter: z.string().optional().describe("Filtreaza dupa URL specific (ex: '/multumim' pentru persoanele care au ajuns pe pagina de multumire). Lasa gol pentru tot site-ul."),
-      description: z.string().optional().describe("Descrierea audientei pentru referinta interna")
+      retention_days: z.number().min(1).max(180).default(30).describe("Perioada de retentie in zile (1-180)."),
+      event_name: z.enum(["PageView","ViewContent","AddToCart","InitiateCheckout","Purchase","Lead","CompleteRegistration","Search","Contact","SubmitApplication"]).default("PageView").describe("Evenimentul pixel pe care se bazeaza audienta."),
+      url_filter: z.string().optional().describe("Filtreaza dupa URL specific. Lasa gol pentru tot site-ul."),
+      description: z.string().optional()
     },
-    async ({ name, pixel_id, retention_days, event_name, url_filter, description }) => {
+    async ({ ad_account_id, name, pixel_id, retention_days, event_name, url_filter, description }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const rule = {
           inclusions: {
             operator: "or",
@@ -1114,7 +1386,7 @@ function createServer() {
           rule: JSON.stringify(rule)
         };
 
-        const d = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", body);
+        const d = await meta(`/act_${acct}/customaudiences`, "POST", body);
         return ok(`Audienta website creata!\nID: ${d.id}\nNume: ${name}\nEveniment: ${event_name}\nRetentie: ${retention_days} zile\n${url_filter ? "Filtru URL: " + url_filter + "\n" : ""}\nFoloseste ID-ul ${d.id} in create_adset pentru retargeting.`);
       } catch (e) { return err(e); }
     }
@@ -1123,36 +1395,19 @@ function createServer() {
   server.tool("create_engagement_audience",
     "Creeaza audienta din persoanele care au interactionat cu pagina Facebook sau contul Instagram.",
     {
+      ...accountParam,
       name: z.string().describe("Numele audientei"),
-      source_type: z.enum([
-        "FACEBOOK_PAGE",
-        "INSTAGRAM_ACCOUNT",
-        "VIDEO",
-        "LEAD_FORM",
-        "EVENT"
-      ]).describe("Sursa de engagement: pagina Facebook, cont Instagram, video, formular lead gen sau eveniment."),
-      source_id: z.string().describe("ID-ul sursei: page_id (din get_pages), instagram_account_id (din list_instagram_accounts), video_id, form_id sau event_id."),
+      source_type: z.enum(["FACEBOOK_PAGE","INSTAGRAM_ACCOUNT","VIDEO","LEAD_FORM","EVENT"]).describe("Sursa de engagement"),
+      source_id: z.string().describe("ID-ul sursei"),
       retention_days: z.number().min(1).max(365).default(30).describe("Perioada de retentie in zile (max 365)."),
-      engagement_type: z.enum([
-        "PAGE_ENGAGED_USERS",
-        "PAGE_VISITORS",
-        "PAGE_SAVED",
-        "PAGE_POST_INTERACTIONS",
-        "PAGE_AD_CLICKERS",
-        "INSTAGRAM_BUSINESS_PROFILE_ALL",
-        "INSTAGRAM_BUSINESS_PROFILE_ENGAGED",
-        "WATCH_85_PERCENT",
-        "WATCH_50_PERCENT",
-        "WATCH_25_PERCENT",
-        "OPENED_FORM",
-        "COMPLETED_FORM"
-      ]).describe("Tipul de interactiune: PAGE_ENGAGED_USERS = toti cei care au interactionat cu pagina, INSTAGRAM_BUSINESS_PROFILE_ALL = toti vizitatorii profilului IG, OPENED_FORM = cei care au deschis formularul lead gen.")
+      engagement_type: z.enum(["PAGE_ENGAGED_USERS","PAGE_VISITORS","PAGE_SAVED","PAGE_POST_INTERACTIONS","PAGE_AD_CLICKERS","INSTAGRAM_BUSINESS_PROFILE_ALL","INSTAGRAM_BUSINESS_PROFILE_ENGAGED","WATCH_85_PERCENT","WATCH_50_PERCENT","WATCH_25_PERCENT","OPENED_FORM","COMPLETED_FORM"]).describe("Tipul de interactiune")
     },
-    async ({ name, source_type, source_id, retention_days, engagement_type }) => {
+    async ({ ad_account_id, name, source_type, source_id, retention_days, engagement_type }) => {
       try {
+        const acct = resolveAccount(ad_account_id);
         const subtype_map = {
           FACEBOOK_PAGE:    "PAGE",
-          INSTAGRAM_ACCOUNT: "INSTAGRAM_BUSINESS",
+          INSTAGRAM_ACCOUNT:"INSTAGRAM_BUSINESS",
           VIDEO:            "VIDEO",
           LEAD_FORM:        "LEAD_GENERATION",
           EVENT:            "EVENT"
@@ -1178,7 +1433,7 @@ function createServer() {
           })
         };
 
-        const d = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", body);
+        const d = await meta(`/act_${acct}/customaudiences`, "POST", body);
         return ok(`Audienta engagement creata!\nID: ${d.id}\nNume: ${name}\nSursa: ${source_type} (${source_id})\nTip engagement: ${engagement_type}\nRetentie: ${retention_days} zile\n\nFoloseste ID-ul ${d.id} in create_adset pentru retargeting.`);
       } catch (e) { return err(e); }
     }
@@ -1187,37 +1442,33 @@ function createServer() {
   server.tool("create_customer_list_audience",
     "Creeaza audienta din lista de clienti (emailuri sau numere de telefon). Meta le hashuieste automat si cauta matching.",
     {
-      name: z.string().describe("Numele audientei (ex: 'Clienti existenti')"),
-      data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor: EMAIL sau PHONE"),
-      values: z.array(z.string()).min(1).max(1000).describe("Lista de emailuri (ex: ['user@exemplu.ro', 'alt@exemplu.ro']) sau telefoane (ex: ['+40712345678']). Max 1000 per request."),
+      ...accountParam,
+      name: z.string().describe("Numele audientei"),
+      data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor"),
+      values: z.array(z.string()).min(1).max(1000).describe("Lista de emailuri sau telefoane. Max 1000 per request."),
       description: z.string().optional()
     },
-    async ({ name, data_type, values, description }) => {
+    async ({ ad_account_id, name, data_type, values, description }) => {
       try {
-        // Step 1: Create the audience
-        const audience = await meta(`/act_${ACCOUNT}/customaudiences`, "POST", {
+        const acct = resolveAccount(ad_account_id);
+        const audience = await meta(`/act_${acct}/customaudiences`, "POST", {
           name,
           subtype: "CUSTOM",
           description: description || `Lista ${data_type.toLowerCase()} - ${values.length} intrari`,
           customer_file_source: "USER_PROVIDED_ONLY"
         });
 
-        // Step 2: Hash and upload data (SHA-256 normalizat)
         const crypto = await import("crypto");
         const normalize = (val, type) => {
           if (type === "EMAIL") return val.toLowerCase().trim();
-          if (type === "PHONE") return val.replace(/\D/g, ""); // doar cifre
+          if (type === "PHONE") return val.replace(/\D/g, "");
           return val;
         };
-        const hashed = values.map(v => {
-          const normalized = normalize(v, data_type);
-          return crypto.createHash("sha256").update(normalized).digest("hex");
-        });
+        const hashed = values.map(v => crypto.createHash("sha256").update(normalize(v, data_type)).digest("hex"));
 
-        const field_map = { EMAIL: "EMAIL", PHONE: "PHONE" };
         await meta(`/${audience.id}/users`, "POST", {
           payload: {
-            schema: [field_map[data_type]],
+            schema: [data_type],
             data: hashed.map(h => [h])
           }
         });
@@ -1229,9 +1480,7 @@ function createServer() {
 
   server.tool("get_audience_details",
     "Vede detalii despre o audienta: marimea, statusul de livrare si tipul.",
-    {
-      audience_id: z.string().describe("ID-ul audientei din list_custom_audiences")
-    },
+    { audience_id: z.string().describe("ID-ul audientei din list_custom_audiences") },
     async ({ audience_id }) => {
       try {
         const fields = "id,name,subtype,approximate_count,delivery_status,data_source,retention_days,rule,description,time_created,time_updated";
@@ -1245,9 +1494,7 @@ function createServer() {
 
   server.tool("delete_audience",
     "Sterge o audienta custom. Atentie: actiunea este ireversibila.",
-    {
-      audience_id: z.string().describe("ID-ul audientei de sters")
-    },
+    { audience_id: z.string().describe("ID-ul audientei de sters") },
     async ({ audience_id }) => {
       try {
         await meta(`/${audience_id}`, "DELETE");
@@ -1257,7 +1504,7 @@ function createServer() {
   );
 
   server.tool("add_users_to_audience",
-    "Adauga utilizatori intr-o audienta existenta (emailuri sau telefoane). Util pentru actualizarea listelor de clienti.",
+    "Adauga utilizatori intr-o audienta existenta (emailuri sau telefoane).",
     {
       audience_id: z.string().describe("ID-ul audientei din list_custom_audiences"),
       data_type: z.enum(["EMAIL","PHONE"]).describe("Tipul datelor"),
@@ -1271,16 +1518,10 @@ function createServer() {
           if (type === "PHONE") return val.replace(/\D/g, "");
           return val;
         };
-        const hashed = values.map(v => {
-          const n = normalize(v, data_type);
-          return crypto.createHash("sha256").update(n).digest("hex");
-        });
+        const hashed = values.map(v => crypto.createHash("sha256").update(normalize(v, data_type)).digest("hex"));
 
         await meta(`/${audience_id}/users`, "POST", {
-          payload: {
-            schema: [data_type],
-            data: hashed.map(h => [h])
-          }
+          payload: { schema: [data_type], data: hashed.map(h => [h]) }
         });
 
         return ok(`${values.length} utilizatori adaugati in audienta ${audience_id}.\nMeta va procesa in 24-48 ore.`);
@@ -1303,16 +1544,10 @@ function createServer() {
           if (type === "PHONE") return val.replace(/\D/g, "");
           return val;
         };
-        const hashed = values.map(v => {
-          const n = normalize(v, data_type);
-          return crypto.createHash("sha256").update(n).digest("hex");
-        });
+        const hashed = values.map(v => crypto.createHash("sha256").update(normalize(v, data_type)).digest("hex"));
 
         await meta(`/${audience_id}/users`, "DELETE", {
-          payload: {
-            schema: [data_type],
-            data: hashed.map(h => [h])
-          }
+          payload: { schema: [data_type], data: hashed.map(h => [h]) }
         });
 
         return ok(`${values.length} utilizatori eliminati din audienta ${audience_id}.`);
@@ -1325,9 +1560,23 @@ function createServer() {
 
 // ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
-app.post("/mcp", async (req, res) => {
+// Middleware de autentificare — pe TOATE endpoint-urile POST /mcp
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const providedSecret = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!providedSecret || providedSecret !== MCP_SECRET) {
+    return res.status(401).json({
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized: Bearer token lipsa sau invalid in Authorization header" },
+      id: null
+    });
+  }
+  next();
+}
+
+app.post("/mcp", authMiddleware, async (req, res) => {
   try {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const server = createServer();
@@ -1342,17 +1591,24 @@ app.post("/mcp", async (req, res) => {
 
 app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 
+// Health check public — util pentru Railway uptime monitoring
+// NU expune niciodata TOKEN sau MCP_SECRET, doar flag-uri boolean de prezenta
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "3.5.0-Final",
-  account: ACCOUNT ? `act_${ACCOUNT}` : "NOT SET",
-  token: TOKEN ? "configured" : "NOT SET",
+  version: "4.0.0",
+  token_configured: !!TOKEN,
+  secret_configured: !!MCP_SECRET,
+  default_account: DEFAULT_ACCT ? `act_${normalizeAccountId(DEFAULT_ACCT)}` : "NOT SET (multi-account mode)",
   api: API
 }));
 
 app.listen(PORT, () => {
-  console.log(`Meta Ads MCP Server v3.5.0-Final running on port ${PORT}`);
-  if (!TOKEN)   console.error("MISSING: META_ADS_ACCESS_TOKEN");
-  if (!ACCOUNT) console.error("MISSING: META_AD_ACCOUNT_ID");
+  console.log(`✓ Meta Ads MCP Server v4.0.0 running on port ${PORT}`);
+  console.log(`✓ Token: configured`);
+  console.log(`✓ MCP secret: configured`);
+  console.log(DEFAULT_ACCT
+    ? `✓ Default account: act_${normalizeAccountId(DEFAULT_ACCT)} (override cu ad_account_id per call)`
+    : `ℹ Multi-account mode: fiecare tool call necesita ad_account_id explicit`
+  );
 });
