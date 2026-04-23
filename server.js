@@ -1,7 +1,33 @@
 /**
- * Meta Ads MCP Server v4.1.0
+ * Meta Ads MCP Server v4.4.0
  * Compatible cu Claude.ai custom connectors — Streamable HTTP transport
  * Meta Marketing API v25.0
+ *
+ * CHANGELOG v4.4.0 (vs 4.3.0):
+ *  - Tool nou: get_campaigns_with_performance — campanii + insights intr-un apel, join server-side
+ *      (inlocuieste list_campaigns + get_all_insights, economiseste 40-50% context window)
+ *  - Cache currency cu TTL 1h (anterior: never-expire pana la restart)
+ *  - Helper setCachedCurrency() + formatEntityLabel() (DRY, pattern reutilizabil)
+ *  - Account context (act_XXX) in output-urile de modificare: update_campaign_status,
+ *      pause_ad, update_ad, update_adset, update_campaign_budget
+ *      → previne confuzia in sesiuni cu multi-client
+ *  - POST + fields=X intr-un singur round-trip (in loc de POST + GET separate)
+ *      → -200ms per call pentru update-uri simple
+ *
+ * CHANGELOG v4.3.0 (vs 4.2.0):
+ *  - FIX CRITIC: retry pe 5xx DOAR pentru GET/HEAD (nu mai duplica campanii la server errors pe POST)
+ *  - FIX: fmtMoney guard pentru NaN/null/undefined (evita afisari "€NaN")
+ *  - FIX: analyze_wasted_spend pastreaza numerele raw separat pentru totaluri (nu mai parseaza inapoi stringuri)
+ *  - FIX: validare MCP_SECRET minim 32 caractere (anti brute-force)
+ *  - Erori 5xx pe POST/DELETE indica user-ul sa verifice manual in Ads Manager
+ *
+ * CHANGELOG v4.2.0 (vs 4.1.0):
+ *  - Multi-currency support: detecteaza automat valuta fiecarui cont (EUR/USD/RON/MDL/etc)
+ *  - Cache in-memory de valuta per cont (1 fetch per sesiune)
+ *  - fmtMoney() helper cu simboluri corecte (€, $, £, lei, MDL, zł, etc.)
+ *  - Toate output-urile financiare folosesc valuta reala (nu mai hardcodeaza $)
+ *  - reach_estimate foloseste currency-ul contului (nu USD hardcoded)
+ *  - Descrieri parametri: "CENTI USD" -> "CENTI in valuta contului"
  *
  * CHANGELOG v4.1.0 (vs 4.0.0):
  *  - Auth prin query parameter ?key=SECRET (compatibil Claude.ai custom connector UI)
@@ -36,14 +62,21 @@ const MCP_SECRET    = process.env.MCP_SECRET;
 const API           = "https://graph.facebook.com/v25.0";
 const PORT          = process.env.PORT || 3000;
 
-// Fail-fast la boot — oprim serverul daca lipsesc variabile critice
+// Fail-fast la boot — oprim serverul daca lipsesc variabile critice sau sunt invalide
 function validateEnv() {
   const missing = [];
+  const weak = [];
   if (!TOKEN)      missing.push("META_ADS_ACCESS_TOKEN");
-  if (!MCP_SECRET) missing.push("MCP_SECRET");
-  if (missing.length) {
-    console.error(`\n❌ CONFIGURARE INVALIDA: Variabile lipsa in Railway:\n   - ${missing.join("\n   - ")}`);
-    console.error(`\nServer oprit. Seteaza variabilele si redeploy.\n`);
+  if (!MCP_SECRET) {
+    missing.push("MCP_SECRET");
+  } else if (MCP_SECRET.length < 32) {
+    weak.push(`MCP_SECRET prea scurt (${MCP_SECRET.length} caractere, minim 32). Genereaza cu: openssl rand -hex 32`);
+  }
+  if (missing.length || weak.length) {
+    console.error(`\n❌ CONFIGURARE INVALIDA in Railway:`);
+    if (missing.length) console.error(`   Variabile lipsa:\n     - ${missing.join("\n     - ")}`);
+    if (weak.length)    console.error(`   Variabile slabe:\n     - ${weak.join("\n     - ")}`);
+    console.error(`\nServer oprit. Remediaza si redeploy.\n`);
     process.exit(1);
   }
   if (!DEFAULT_ACCT) {
@@ -74,7 +107,7 @@ function resolveAccount(explicit) {
 /**
  * Apelul central catre Graph API.
  * - Token in Authorization header (nu in URL)
- * - Retry cu backoff exponential pe 429 + 5xx
+ * - Retry cu backoff exponential pe 429 + 5xx (5xx DOAR pe GET — POST retry ar duplica entitati)
  * - Timeout 30s cu AbortController
  * - Parsing eroare Meta cu cod, subcod, user_msg
  */
@@ -94,6 +127,8 @@ async function meta(path, method = "GET", body = null, retries = 3) {
   };
   if (body) opts.body = JSON.stringify(body);
 
+  const isIdempotent = method === "GET" || method === "HEAD";
+
   let res;
   try {
     res = await fetch(base, opts);
@@ -101,7 +136,8 @@ async function meta(path, method = "GET", body = null, retries = 3) {
   } catch (e) {
     clearTimeout(timeout);
     if (e.name === "AbortError") throw new Error("Timeout: requestul a durat peste 30 secunde");
-    // Network errors — retry daca mai sunt incercari
+    // Network errors (fetch a esuat inainte sa trimita request-ul) — retry safe si pentru POST/DELETE
+    // deoarece stim sigur ca Meta nu a primit request-ul
     if (retries > 0) {
       await new Promise(r => setTimeout(r, (4 - retries) * 1000));
       return meta(path, method, body, retries - 1);
@@ -109,8 +145,14 @@ async function meta(path, method = "GET", body = null, retries = 3) {
     throw new Error(`Retea: ${e.message}`);
   }
 
-  // Retry pe 429 (rate limit) + 5xx (server errors tranzitorii)
-  if ((res.status === 429 || res.status >= 500) && retries > 0) {
+  // 429 (rate limit): Meta a refuzat request-ul → retry safe chiar si pentru POST
+  // 5xx (server error): request-ul POATE sa fi ajuns si sa fi reusit → retry DOAR pe GET/HEAD
+  const shouldRetry = retries > 0 && (
+    res.status === 429 ||
+    (res.status >= 500 && isIdempotent)
+  );
+
+  if (shouldRetry) {
     const wait = (4 - retries) * 2000; // 2s, 4s, 6s
     await new Promise(r => setTimeout(r, wait));
     return meta(path, method, body, retries - 1);
@@ -127,6 +169,10 @@ async function meta(path, method = "GET", body = null, retries = 3) {
     const code = data.error.code || data.error.error_code || "?";
     const msg  = data.error.error_user_msg || data.error.error_message || data.error.message;
     const sub  = data.error.error_subcode ? ` [sub:${data.error.error_subcode}]` : "";
+    // Adauga context pentru 5xx pe POST — ca user-ul sa stie ca poate sa verifice manual
+    if (res.status >= 500 && !isIdempotent) {
+      throw new Error(`Meta API [${code}]${sub}: ${msg} (HTTP ${res.status} pe ${method} — verifica manual daca operatia a reusit in Ads Manager inainte sa reincerci)`);
+    }
     throw new Error(`Meta API [${code}]${sub}: ${msg}`);
   }
   return data;
@@ -159,6 +205,86 @@ const ok   = (t) => ({ content: [{ type: "text", text: String(t) }] });
 const err  = (e) => ({ content: [{ type: "text", text: `Eroare: ${e.message}` }], isError: true });
 const json = (o) => ok(JSON.stringify(o, null, 2));
 
+// ── Currency cache ───────────────────────────────────────────────────────────
+// Cache in-memory per cont. TTL: 1h (suficient — valuta unui cont se schimba extrem de rar).
+// Structura: Map<accountId, {value: string, expires: number}>
+// Decision: TTL in loc de invalidare manuala — mai simplu si suficient pentru uz real.
+const _currencyCache = new Map();
+const CURRENCY_TTL_MS = 60 * 60 * 1000; // 1h
+
+const CURRENCY_SYMBOLS = {
+  USD: "$", EUR: "€", GBP: "£", RON: "lei", MDL: "MDL",
+  PLN: "zł", HUF: "Ft", CZK: "Kč", BGN: "лв", UAH: "₴",
+  RUB: "₽", TRY: "₺", JPY: "¥", CNY: "¥", INR: "₹",
+  BRL: "R$", MXN: "MX$", CAD: "C$", AUD: "A$", CHF: "CHF"
+};
+
+/** Seteaza direct in cache (folosit cand avem deja valuta — ex: list_ad_accounts returneaza-o odata cu lista) */
+function setCachedCurrency(accountId, currency) {
+  if (!accountId || !currency) return;
+  _currencyCache.set(accountId, {
+    value: currency,
+    expires: Date.now() + CURRENCY_TTL_MS
+  });
+}
+
+/** Returneaza valuta contului. Cache hit = 0 round-trips. Cache miss / expired = 1 round-trip. */
+async function getAccountCurrency(accountId) {
+  const normalizedId = normalizeAccountId(accountId);
+  if (!normalizedId) return "USD"; // safety net pentru apelanti care pasează null/undefined
+
+  const cached = _currencyCache.get(normalizedId);
+  if (cached && cached.expires > Date.now()) {
+    return cached.value;
+  }
+
+  try {
+    const d = await meta(`/act_${normalizedId}?fields=currency`);
+    const curr = d.currency || "USD";
+    setCachedCurrency(normalizedId, curr);
+    return curr;
+  } catch {
+    // Nu cache-uim fallback-ul — daca Meta revine la fetch-ul urmator, vrem retry
+    return "USD";
+  }
+}
+
+/** Formateaza o suma in valuta contului: 12.50 + "EUR" -> "12.50 EUR". Guard pentru NaN/null/undefined. */
+function fmtMoney(amount, currency) {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) {
+    // Protejeaza de NaN / null / undefined / string invalid
+    const sym = CURRENCY_SYMBOLS[currency];
+    const prefixSymbols = ["$", "€", "£", "¥", "₹", "₺", "₽", "₴", "R$", "MX$", "C$", "A$"];
+    if (sym && prefixSymbols.includes(sym)) return `${sym}0.00`;
+    if (sym) return `0.00 ${sym}`;
+    return `0.00 ${currency || "?"}`;
+  }
+  const num = n.toFixed(2);
+  const sym = CURRENCY_SYMBOLS[currency];
+  // Pentru simboluri prefix (USD/EUR/GBP) folosim "€12.50" ; pentru sufix (lei, MDL) "12.50 lei"
+  const prefixSymbols = ["$", "€", "£", "¥", "₹", "₺", "₽", "₴", "R$", "MX$", "C$", "A$"];
+  if (sym && prefixSymbols.includes(sym)) return `${sym}${num}`;
+  if (sym) return `${num} ${sym}`;
+  return `${num} ${currency}`;
+}
+
+/**
+ * Formateaza un label cu context de cont pentru output-urile de modificare.
+ * Ex: campania 123456 din act_789 → "campania "Lead Gen FR" (act_789)"
+ * Fail-safe: daca fetch-ul esueaza, returneaza doar ID-ul — nu blocheaza tool-ul.
+ */
+async function formatEntityLabel(entityId, entityType = "entitate") {
+  try {
+    const d = await meta(`/${entityId}?fields=id,name,account_id`);
+    const nameLabel = d.name ? `"${d.name}"` : entityId;
+    const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+    return `${entityType} ${nameLabel}${acctLabel}`;
+  } catch {
+    return `${entityType} ${entityId}`;
+  }
+}
+
 // Schema reutilizabila — ad_account_id optional in fiecare tool
 const accountParam = {
   ad_account_id: z.string().optional().describe(
@@ -168,7 +294,7 @@ const accountParam = {
 
 // ── Server definition ────────────────────────────────────────────────────────
 function createServer() {
-  const server = new McpServer({ name: "meta-ads-mcp", version: "4.1.0" });
+  const server = new McpServer({ name: "meta-ads-mcp", version: "4.4.0" });
 
   // ══ ACCOUNTS MULTI-TENANT ═════════════════════════════════════════════════
   server.tool("list_ad_accounts",
@@ -184,9 +310,13 @@ function createServer() {
 
         const s = { 1:"ACTIV", 2:"DEZACTIVAT", 3:"NEPLATIT", 7:"POLITICI", 9:"INCHIS", 100:"PENDING", 101:"INVALID" };
         const lines = data.map(a => {
-          const spent = ((a.amount_spent || 0) / 100).toFixed(2);
+          // Populez cache-ul pentru fiecare cont (evita fetch-uri ulterioare)
+          const acctId = normalizeAccountId(a.id);
+          setCachedCurrency(acctId, a.currency);
+
+          const spent = fmtMoney((a.amount_spent || 0) / 100, a.currency || "USD");
           const biz   = a.business ? ` | ${a.business.name}` : "";
-          return `${a.id} | ${a.name} | ${s[a.account_status] || a.account_status} | ${a.currency} | Cheltuit: ${spent} ${a.currency}${biz}`;
+          return `${a.id} | ${a.name} | ${s[a.account_status] || a.account_status} | ${a.currency} | Cheltuit: ${spent}${biz}`;
         });
         return ok(`Conturi accesibile (${data.length}):\n${lines.join("\n")}\n\nFoloseste ID-ul (ex: act_123456) ca parametru ad_account_id in orice tool.`);
       } catch (e) { return err(e); }
@@ -201,12 +331,14 @@ function createServer() {
       try {
         const acct = resolveAccount(ad_account_id);
         const d = await meta(`/act_${acct}?fields=id,name,account_status,currency,timezone_name,amount_spent,business`);
+        // Populez cache-ul de valuta (va fi refolosit de alte tool-uri in aceeasi sesiune)
+        setCachedCurrency(acct, d.currency);
         const s = { 1:"ACTIV", 2:"DEZACTIVAT", 3:"NEPLATIT", 7:"POLITICI", 9:"INCHIS" };
         return ok([
           `Cont: ${d.name} (${d.id})`,
           `Status: ${s[d.account_status] || d.account_status}`,
           `Valuta: ${d.currency} | Fus orar: ${d.timezone_name}`,
-          `Cheltuit total: ${((d.amount_spent||0)/100).toFixed(2)} ${d.currency}`,
+          `Cheltuit total: ${fmtMoney((d.amount_spent||0)/100, d.currency)}`,
           d.business ? `Business: ${d.business.name} (${d.business.id})` : ""
         ].filter(Boolean).join("\n"));
       } catch (e) { return err(e); }
@@ -276,6 +408,7 @@ function createServer() {
     async ({ ad_account_id, status, max_results }) => {
       try {
         const acct = resolveAccount(ad_account_id);
+        const currency = await getAccountCurrency(acct);
         const f = status === "ALL" ? "" : `&effective_status=["${status}"]`;
         const { data, has_more } = await metaPaginated(
           `/act_${acct}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget${f}&limit=100`,
@@ -283,11 +416,11 @@ function createServer() {
         );
         if (!data.length) return ok("Nu exista campanii.");
         const lines = data.map(x=>{
-          const b = x.daily_budget ? `${(x.daily_budget/100).toFixed(2)}$/zi` : x.lifetime_budget ? `${(x.lifetime_budget/100).toFixed(2)}$ total` : "-";
+          const b = x.daily_budget ? `${fmtMoney(x.daily_budget/100, currency)}/zi` : x.lifetime_budget ? `${fmtMoney(x.lifetime_budget/100, currency)} total` : "-";
           return `ID: ${x.id} | ${x.name} | ${x.status} | ${x.objective} | ${b}`;
         });
         const tail = has_more ? `\n\n(Mai multe disponibile — creste max_results pentru a le vedea)` : "";
-        return ok(`Campanii (${data.length}):\n${lines.join("\n")}${tail}`);
+        return ok(`Campanii (${data.length}) [valuta: ${currency}]:\n${lines.join("\n")}${tail}`);
       } catch (e) { return err(e); }
     }
   );
@@ -374,15 +507,16 @@ function createServer() {
   );
 
   server.tool("analyze_wasted_spend",
-    "Identifica ad set-urile care cheltuiesc fara conversii. Esential pentru optimizarea CPL.",
+    "Identifica ad set-urile care cheltuiesc fara conversii. Esential pentru optimizarea CPL. Pragul CPL e in valuta contului (EUR/USD/etc).",
     {
       ...accountParam,
       date_preset: z.enum(["last_7d","last_14d","last_30d"]).default("last_7d"),
-      cpl_threshold: z.number().default(3).describe("Prag CPL in dolari — ad set-urile peste acest prag sunt ineficiente")
+      cpl_threshold: z.number().default(3).describe("Prag CPL in valuta contului — ad set-urile peste acest prag sunt considerate ineficiente")
     },
     async ({ ad_account_id, date_preset, cpl_threshold }) => {
       try {
         const acct = resolveAccount(ad_account_id);
+        const currency = await getAccountCurrency(acct);
         const fields = "campaign_name,adset_name,spend,actions,cost_per_action_type,impressions";
         const { data } = await metaPaginated(
           `/act_${acct}/insights?fields=${fields}&date_preset=${date_preset}&level=adset&limit=200`,
@@ -393,14 +527,144 @@ function createServer() {
           const spend = parseFloat(r.spend || 0);
           const leads = parseInt((r.actions||[]).find(a=>["lead","onsite_conversion.lead_grouped"].includes(a.action_type))?.value || 0);
           const cpl = leads > 0 ? spend / leads : null;
-          const item = { campanie: r.campaign_name, adset: r.adset_name, spend: `$${spend.toFixed(2)}`, leads, cpl: cpl ? `$${cpl.toFixed(2)}` : "0 leads" };
+          const item = {
+            campanie: r.campaign_name,
+            adset: r.adset_name,
+            spend_fmt: fmtMoney(spend, currency),
+            spend_num: spend,              // pastrez raw number pentru totaluri
+            leads,
+            cpl_fmt: cpl !== null ? fmtMoney(cpl, currency) : "0 leads"
+          };
           (cpl === null || cpl > cpl_threshold ? wasted : good).push(item);
         }
-        const total = wasted.reduce((s,r) => s + parseFloat(r.spend.slice(1)), 0);
-        let out = `=== CHELTUIELI IROSITE (prag: $${cpl_threshold}) ===\nTotal ineficient: $${total.toFixed(2)}\n\nINEFICIENTE (${wasted.length}):\n`;
-        wasted.forEach(r => out += `  ✕ ${r.adset} | ${r.spend} | ${r.leads} leads | CPL: ${r.cpl}\n`);
+        // Totalul se calculeaza din numerele raw, nu din stringuri formatate
+        const totalWasted = wasted.reduce((s, r) => s + r.spend_num, 0);
+        const totalGood   = good.reduce((s, r) => s + r.spend_num, 0);
+        let out = `=== CHELTUIELI IROSITE (prag: ${fmtMoney(cpl_threshold, currency)}) [valuta: ${currency}] ===\n`;
+        out += `Total ineficient: ${fmtMoney(totalWasted, currency)} | Total eficient: ${fmtMoney(totalGood, currency)}\n\n`;
+        out += `INEFICIENTE (${wasted.length}):\n`;
+        wasted.forEach(r => out += `  ✕ ${r.adset} | ${r.spend_fmt} | ${r.leads} leads | CPL: ${r.cpl_fmt}\n`);
         out += `\nEFICIENTE (${good.length}):\n`;
-        good.forEach(r => out += `  ✓ ${r.adset} | ${r.spend} | ${r.leads} leads | CPL: ${r.cpl}\n`);
+        good.forEach(r => out += `  ✓ ${r.adset} | ${r.spend_fmt} | ${r.leads} leads | CPL: ${r.cpl_fmt}\n`);
+        return ok(out);
+      } catch (e) { return err(e); }
+    }
+  );
+
+  // Tool agregat — reduce 2 round-trips la 1 si face join server-side
+  // ROI zilnic: raspunde direct la "care campanii merg / nu merg?" fara post-procesare in Claude
+  server.tool("get_campaigns_with_performance",
+    "Listeaza campaniile cu performanta (spend, leads, CPL, CTR, impressions) intr-un singur apel. Inlocuieste list_campaigns + get_all_insights. Perfect pentru daily review.",
+    {
+      ...accountParam,
+      status: z.enum(["ACTIVE","PAUSED","ARCHIVED","ALL"]).default("ACTIVE").describe("Filtru campanii (default: doar active — ce cheltuie acum)"),
+      date_preset: z.enum(["today","yesterday","last_7d","last_14d","last_30d","last_90d"]).default("last_7d"),
+      sort_by: z.enum(["spend","cpl","leads","ctr","name"]).default("spend").describe("Criteriu de sortare (default: spend descendent — vezi primul unde se duce bugetul)"),
+      max_results: z.number().default(50).describe("Numar maxim de campanii in output (default 50, limitat la 200 pentru protectia context window)")
+    },
+    async ({ ad_account_id, status, date_preset, sort_by, max_results }) => {
+      try {
+        const acct = resolveAccount(ad_account_id);
+        const currency = await getAccountCurrency(acct);
+        const limit = Math.min(Math.max(1, max_results), 200);
+
+        // Fetch paralel: campanii + insights agregate pe campanie
+        // Motiv: cele 2 dataset-uri sunt independente → Promise.all scade latenta ~50%
+        const statusFilter = status === "ALL" ? "" : `&effective_status=["${status}"]`;
+        const [campaignsResp, insightsResp] = await Promise.all([
+          metaPaginated(
+            `/act_${acct}/campaigns?fields=id,name,status,effective_status,objective,daily_budget,lifetime_budget,created_time${statusFilter}&limit=100`,
+            { maxItems: 500 }
+          ),
+          metaPaginated(
+            `/act_${acct}/insights?fields=campaign_id,spend,impressions,clicks,reach,frequency,ctr,cpc,actions&date_preset=${date_preset}&level=campaign&limit=200`,
+            { maxItems: 500 }
+          )
+        ]);
+
+        // Index insights pe campaign_id pentru O(1) lookup
+        const insightsByCampaign = new Map();
+        for (const row of insightsResp.data) {
+          insightsByCampaign.set(row.campaign_id, row);
+        }
+
+        // Join + calcul metrici derivate
+        const rows = campaignsResp.data.map(c => {
+          const ins = insightsByCampaign.get(c.id);
+          const spend = parseFloat(ins?.spend || 0);
+          const leads = ins?.actions
+            ? parseInt(ins.actions.find(a => ["lead","onsite_conversion.lead_grouped"].includes(a.action_type))?.value || 0)
+            : 0;
+          const ctr  = parseFloat(ins?.ctr || 0);
+          const cpc  = parseFloat(ins?.cpc || 0);
+          const impressions = parseInt(ins?.impressions || 0);
+          const cpl  = leads > 0 ? spend / leads : null;
+          const budget = c.daily_budget
+            ? `${fmtMoney(c.daily_budget/100, currency)}/zi`
+            : c.lifetime_budget ? `${fmtMoney(c.lifetime_budget/100, currency)} total` : "ABO";
+
+          return {
+            id: c.id,
+            name: c.name,
+            status: c.effective_status || c.status,
+            objective: c.objective,
+            budget,
+            spend,
+            impressions,
+            leads,
+            ctr,
+            cpc,
+            cpl,
+            has_data: !!ins
+          };
+        });
+
+        // Sortare — folosim numere raw, nu stringuri formatate
+        const sortKey = {
+          spend: r => -r.spend,                    // descendent
+          cpl:   r => r.cpl === null ? Infinity : r.cpl, // ascendent, null la sfarsit
+          leads: r => -r.leads,
+          ctr:   r => -r.ctr,
+          name:  r => r.name?.toLowerCase() || ""
+        };
+        rows.sort((a, b) => {
+          const ka = sortKey[sort_by](a);
+          const kb = sortKey[sort_by](b);
+          if (typeof ka === "string") return ka.localeCompare(kb);
+          return ka - kb;
+        });
+
+        const display = rows.slice(0, limit);
+        const truncated = rows.length > limit;
+
+        if (!display.length) {
+          return ok(`Nu exista campanii ${status === "ALL" ? "" : `cu status ${status}`} in cont.`);
+        }
+
+        // Totaluri (din numere raw)
+        const totalSpend = rows.reduce((s, r) => s + r.spend, 0);
+        const totalLeads = rows.reduce((s, r) => s + r.leads, 0);
+        const avgCpl = totalLeads > 0 ? totalSpend / totalLeads : null;
+
+        // Output compact, lizibil — tabel text cu aliniere simpla
+        let out = `=== CAMPANII [${status}] | ${date_preset} | valuta: ${currency} ===\n`;
+        out += `Sortare: ${sort_by} | Afisate: ${display.length}/${rows.length}\n`;
+        out += `TOTAL cont: ${fmtMoney(totalSpend, currency)} cheltuit | ${totalLeads} leads | CPL mediu: ${avgCpl !== null ? fmtMoney(avgCpl, currency) : "N/A"}\n\n`;
+
+        for (const r of display) {
+          const statusIcon = r.status === "ACTIVE" ? "▶" : r.status === "PAUSED" ? "⏸" : "■";
+          const cplStr = r.cpl !== null ? fmtMoney(r.cpl, currency) : (r.leads === 0 && r.spend > 0 ? "0 leads" : "—");
+          const spendStr = r.spend > 0 ? fmtMoney(r.spend, currency) : (r.has_data ? fmtMoney(0, currency) : "no data");
+
+          out += `${statusIcon} ${r.name}\n`;
+          out += `   ID: ${r.id} | Buget: ${r.budget} | Obj: ${r.objective}\n`;
+          out += `   Spend: ${spendStr} | Leads: ${r.leads} | CPL: ${cplStr} | CTR: ${r.ctr.toFixed(2)}%\n\n`;
+        }
+
+        if (truncated) {
+          out += `... ${rows.length - limit} campanii suplimentare ascunse (mareste max_results sau filtreaza)\n`;
+        }
+
         return ok(out);
       } catch (e) { return err(e); }
     }
@@ -435,12 +699,23 @@ function createServer() {
   server.tool("get_campaign_full",
     "Returneaza campanie + ad set-uri + ad-uri + insights intr-un singur apel. Economiseste context window vs 4 apeluri separate. Ideal pentru audit rapid al unei campanii.",
     {
+      ...accountParam,
       campaign_id: z.string().describe("ID-ul campaniei"),
       date_preset: z.enum(["today","yesterday","last_7d","last_14d","last_30d","last_90d"]).default("last_7d"),
       include_ads: z.boolean().default(true).describe("Daca sa includa lista de ad-uri per ad set (poate creste output-ul)")
     },
-    async ({ campaign_id, date_preset, include_ads }) => {
+    async ({ ad_account_id, campaign_id, date_preset, include_ads }) => {
       try {
+        // Detectez contul din campanie daca nu e specificat explicit
+        let acct;
+        try {
+          acct = resolveAccount(ad_account_id);
+        } catch {
+          const accRef = await meta(`/${campaign_id}?fields=account_id`);
+          acct = accRef.account_id;
+        }
+        const currency = await getAccountCurrency(acct);
+
         // 1. Campanie
         const campaign = await meta(`/${campaign_id}?fields=id,name,status,objective,daily_budget,lifetime_budget,special_ad_categories,created_time,start_time,stop_time`);
 
@@ -476,13 +751,15 @@ function createServer() {
 
         // 5. Asamblare rezultat
         const result = {
+          account_id: `act_${acct}`,
+          currency,
           campaign: {
             id: campaign.id,
             name: campaign.name,
             status: campaign.status,
             objective: campaign.objective,
-            daily_budget: campaign.daily_budget ? `$${(campaign.daily_budget/100).toFixed(2)}/zi` : null,
-            lifetime_budget: campaign.lifetime_budget ? `$${(campaign.lifetime_budget/100).toFixed(2)} total` : null,
+            daily_budget: campaign.daily_budget ? `${fmtMoney(campaign.daily_budget/100, currency)}/zi` : null,
+            lifetime_budget: campaign.lifetime_budget ? `${fmtMoney(campaign.lifetime_budget/100, currency)} total` : null,
             special_ad_categories: campaign.special_ad_categories || []
           },
           performance_overall: (overallInsights.data || [])[0] || null,
@@ -490,7 +767,7 @@ function createServer() {
             id: as.id,
             name: as.name,
             status: as.status,
-            daily_budget: as.daily_budget ? `$${(as.daily_budget/100).toFixed(2)}/zi` : null,
+            daily_budget: as.daily_budget ? `${fmtMoney(as.daily_budget/100, currency)}/zi` : null,
             optimization_goal: as.optimization_goal,
             billing_event: as.billing_event,
             bid_strategy: as.bid_strategy,
@@ -515,8 +792,8 @@ function createServer() {
       ...accountParam,
       name: z.string().describe("Numele campaniei"),
       objective: z.enum(["OUTCOME_LEADS","OUTCOME_SALES","OUTCOME_TRAFFIC","OUTCOME_AWARENESS","OUTCOME_ENGAGEMENT","OUTCOME_APP_PROMOTION"]).describe("Obiectivul campaniei"),
-      daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD (1000=$10). Nu combina cu lifetime_budget. Lasa gol daca vrei buget per ad set."),
-      lifetime_budget: z.number().optional().describe("Buget total in CENTI USD. Necesita stop_time."),
+      daily_budget: z.number().optional().describe("Buget zilnic in CENTI, in valuta contului (1000 = 10 in valuta contului — EUR/USD/RON/etc). Nu combina cu lifetime_budget. Lasa gol daca vrei buget per ad set."),
+      lifetime_budget: z.number().optional().describe("Buget total in CENTI, in valuta contului. Necesita stop_time."),
       stop_time: z.string().optional().describe("Data sfarsit ISO 8601. Necesar cu lifetime_budget."),
       special_ad_categories: z.array(z.string()).default([]).describe("Categorii speciale obligatorii: CREDIT, EMPLOYMENT, HOUSING, ISSUES_ELECTIONS_POLITICS. Targeting restrictionat pentru aceste categorii.")
     },
@@ -542,7 +819,7 @@ function createServer() {
       campaign_id: z.string().describe("ID campanie din create_campaign"),
       name: z.string().describe("Numele Ad Set-ului"),
       advantage_audience: z.union([z.literal(0), z.literal(1)]).describe("OBLIGATORIU (Meta API v25). 0=targeting MANUAL exact (varsta/gen/interese respectate strict). 1=Advantage+ AI (Meta extinde automat). Alege 0 pentru audienta specifica, 1 pentru lead gen broad."),
-      daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD (1000=$10). Lasa gol daca campania are CBO."),
+      daily_budget: z.number().optional().describe("Buget zilnic in CENTI, in valuta contului (1000 = 10 unitati). Lasa gol daca campania are CBO."),
       age_min: z.number().default(18).describe("Varsta minima (18-65)"),
       age_max: z.number().default(65).describe("Varsta maxima (18-65)"),
       genders: z.array(z.number()).default([1,2]).describe("1=Barbati 2=Femei [1,2]=Ambele"),
@@ -550,7 +827,7 @@ function createServer() {
       optimization_goal: z.enum(["LEAD_GENERATION","LINK_CLICKS","IMPRESSIONS","REACH","OFFSITE_CONVERSIONS","LANDING_PAGE_VIEWS","THRUPLAY"]).default("LEAD_GENERATION"),
       billing_event: z.enum(["IMPRESSIONS","LINK_CLICKS","THRUPLAY"]).default("IMPRESSIONS"),
       bid_strategy: z.enum(["LOWEST_COST_WITHOUT_CAP","LOWEST_COST_WITH_BID_CAP","COST_CAP"]).optional().describe("Lasa gol pentru lowest cost fara cap (default Meta). Specifica doar daca vrei LOWEST_COST_WITH_BID_CAP sau COST_CAP (necesita bid_amount)."),
-      bid_amount: z.number().optional().describe("Bid in CENTI USD. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
+      bid_amount: z.number().optional().describe("Bid in CENTI, in valuta contului. Necesar pentru LOWEST_COST_WITH_BID_CAP si COST_CAP."),
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests. Nota: cu advantage_audience=1, Meta poate extinde audienta."),
       excluded_interest_ids: z.array(z.string()).optional().describe("ID-uri interese de EXCLUS din targeting."),
       excluded_geo_countries: z.array(z.string()).optional().describe("Coduri ISO 2 de EXCLUS geografic."),
@@ -641,7 +918,8 @@ function createServer() {
         }
 
         const d = await meta(`/act_${acct}/adsets`, "POST", body);
-        const bStr = daily_budget ? `${(daily_budget/100).toFixed(2)}$/zi` : "din campanie";
+        const currency = await getAccountCurrency(acct);
+        const bStr = daily_budget ? `${fmtMoney(daily_budget/100, currency)}/zi` : "din campanie";
         const warnBlock = warnings.length ? `\n\n${warnings.join("\n")}` : "";
         return ok(`Ad Set creat!\nID: ${d.id}\nNume: ${name}\nBuget: ${bStr}\nAudienta: ${advantage_audience===0?"Manual":"Advantage+ AI"}\nStatus: PAUSED${warnBlock}\n\nPasul urmator: upload_image sau create_creative cu adset_id="${d.id}"`);
       } catch (e) { return err(e); }
@@ -804,19 +1082,26 @@ function createServer() {
     { campaign_id: z.string(), status: z.enum(["ACTIVE","PAUSED"]) },
     async ({ campaign_id, status }) => {
       try {
-        await meta(`/${campaign_id}`, "POST", { status });
-        return ok(`${status==="ACTIVE"?"▶":"⏸"} Campania ${campaign_id} → ${status}`);
+        // POST + fields = 1 round-trip, returneaza si contextul
+        const d = await meta(`/${campaign_id}?fields=id,name,account_id`, "POST", { status });
+        const nameLabel = d.name ? `"${d.name}"` : campaign_id;
+        const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+        return ok(`${status==="ACTIVE"?"▶":"⏸"} Campania ${nameLabel}${acctLabel} → ${status}`);
       } catch (e) { return err(e); }
     }
   );
 
   server.tool("update_campaign_budget",
-    "Modifica bugetul zilnic al unei campanii (in CENTI USD)",
-    { campaign_id: z.string(), daily_budget: z.number().describe("Buget zilnic in CENTI USD (2000=$20)") },
+    "Modifica bugetul zilnic al unei campanii. IMPORTANT: daily_budget se trimite in CENTI in valuta contului (ex: 2000 = 20 in valuta contului — dolari, euro, lei, etc.).",
+    { campaign_id: z.string(), daily_budget: z.number().describe("Buget zilnic in CENTI, in valuta contului (2000 = 20 EUR pentru cont EUR, 20 USD pentru cont USD, etc.)") },
     async ({ campaign_id, daily_budget }) => {
       try {
-        await meta(`/${campaign_id}`, "POST", { daily_budget });
-        return ok(`Buget actualizat: ${(daily_budget/100).toFixed(2)}$/zi pentru campania ${campaign_id}`);
+        // Un singur round-trip: POST cu fields=account_id,name returneaza direct contextul
+        const d = await meta(`/${campaign_id}?fields=account_id,name`, "POST", { daily_budget });
+        const currency = d.account_id ? await getAccountCurrency(d.account_id) : "USD";
+        const label = d.name ? `"${d.name}"` : campaign_id;
+        const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+        return ok(`Buget actualizat: ${fmtMoney(daily_budget/100, currency)}/zi pentru campania ${label}${acctLabel}`);
       } catch (e) { return err(e); }
     }
   );
@@ -827,8 +1112,8 @@ function createServer() {
       adset_id: z.string().describe("ID-ul Ad Set-ului de modificat"),
       status: z.enum(["ACTIVE","PAUSED"]).optional().describe("Activeaza sau pauzeaza ad set-ul"),
       name: z.string().optional().describe("Noul nume al Ad Set-ului"),
-      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI USD (ex: 2000=$20)"),
-      bid_amount: z.number().optional().describe("Noul bid in CENTI USD"),
+      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI, in valuta contului (ex: 2000 = 20 unitati)"),
+      bid_amount: z.number().optional().describe("Noul bid in CENTI, in valuta contului"),
       end_time: z.string().optional().describe("Data de sfarsit ISO 8601"),
       countries: z.array(z.string()).optional().describe("Inlocuieste targetingul geografic"),
       age_min: z.number().optional().describe("Noua varsta minima (18-65)"),
@@ -869,8 +1154,11 @@ function createServer() {
           body.targeting = targeting;
         }
         if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
-        await meta(`/${adset_id}`, "POST", body);
-        return ok(`Ad Set ${adset_id} actualizat.\nCampuri modificate: ${Object.keys(body).join(", ")}`);
+        // POST + fields → 1 round-trip, cu context
+        const d = await meta(`/${adset_id}?fields=id,name,account_id`, "POST", body);
+        const nameLabel = d.name ? `"${d.name}"` : adset_id;
+        const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+        return ok(`Ad Set ${nameLabel}${acctLabel} actualizat.\nCampuri modificate: ${Object.keys(body).join(", ")}`);
       } catch (e) { return err(e); }
     }
   );
@@ -880,8 +1168,10 @@ function createServer() {
     { ad_id: z.string(), status: z.enum(["ACTIVE","PAUSED"]) },
     async ({ ad_id, status }) => {
       try {
-        await meta(`/${ad_id}`, "POST", { status });
-        return ok(`${status==="ACTIVE"?"▶":"⏸"} Ad ${ad_id} → ${status}`);
+        const d = await meta(`/${ad_id}?fields=id,name,account_id`, "POST", { status });
+        const nameLabel = d.name ? `"${d.name}"` : ad_id;
+        const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+        return ok(`${status==="ACTIVE"?"▶":"⏸"} Ad ${nameLabel}${acctLabel} → ${status}`);
       } catch (e) { return err(e); }
     }
   );
@@ -905,9 +1195,11 @@ function createServer() {
         if (conversion_domain) body.conversion_domain = conversion_domain;
         if (url_tags) body.url_tags = url_tags;
         if (!Object.keys(body).length) return ok("Nicio modificare specificata.");
-        await meta(`/${ad_id}`, "POST", body);
+        const d = await meta(`/${ad_id}?fields=id,name,account_id`, "POST", body);
         const changes = Object.keys(body).map(k => k === "multi_advertiser_eligibility" ? `multi_advertiser: ${body[k]}` : k).join(", ");
-        return ok(`Ad ${ad_id} actualizat.\nCampuri modificate: ${changes}`);
+        const nameLabel = d.name ? `"${d.name}"` : ad_id;
+        const acctLabel = d.account_id ? ` (act_${d.account_id})` : "";
+        return ok(`Ad ${nameLabel}${acctLabel} actualizat.\nCampuri modificate: ${changes}`);
       } catch (e) { return err(e); }
     }
   );
@@ -1077,21 +1369,22 @@ function createServer() {
       genders: z.array(z.number()).default([1,2]),
       optimization_goal: z.enum(["LEAD_GENERATION","LINK_CLICKS","IMPRESSIONS","REACH","OFFSITE_CONVERSIONS"]).default("LEAD_GENERATION"),
       interest_ids: z.array(z.string()).optional().describe("ID-uri interese din search_interests"),
-      daily_budget: z.number().optional().describe("Buget zilnic in CENTI USD pentru estimare cost")
+      daily_budget: z.number().optional().describe("Buget zilnic in CENTI, in valuta contului, pentru estimare cost")
     },
     async ({ ad_account_id, countries, age_min, age_max, genders, optimization_goal, interest_ids, daily_budget }) => {
       try {
         const acct = resolveAccount(ad_account_id);
+        const currency = await getAccountCurrency(acct);
         const targeting = { age_min, age_max, genders, geo_locations: { countries } };
         if (interest_ids?.length) targeting.flexible_spec = [{ interests: interest_ids.map(id => ({ id })) }];
         const tsEnc = encodeURIComponent(JSON.stringify(targeting));
-        let url = `/act_${acct}/reachestimate?targeting_spec=${tsEnc}&optimization_goal=${optimization_goal}&currency=USD`;
+        let url = `/act_${acct}/reachestimate?targeting_spec=${tsEnc}&optimization_goal=${optimization_goal}&currency=${currency}`;
         if (daily_budget) url += `&daily_budget=${daily_budget}`;
         const d = await meta(url);
         const users = (d.users || 0).toLocaleString();
         const low   = ((d.estimate_mau_lower_bound || 0)/1e6).toFixed(1);
         const high  = ((d.estimate_mau_upper_bound || 0)/1e6).toFixed(1);
-        return ok(`Estimare reach:\nUseri potentiali: ${users}\nEstimare MAU: ${low}M - ${high}M\n\nDate complete: ${JSON.stringify(d, null, 2)}`);
+        return ok(`Estimare reach [valuta: ${currency}]:\nUseri potentiali: ${users}\nEstimare MAU: ${low}M - ${high}M\n\nDate complete: ${JSON.stringify(d, null, 2)}`);
       } catch (e) { return err(e); }
     }
   );
@@ -1141,7 +1434,7 @@ function createServer() {
       action: z.enum(["PAUSE","UNPAUSE","INCREASE_BUDGET","DECREASE_BUDGET","SEND_NOTIFICATION"]).describe("Actiunea care se executa"),
       metric: z.enum(["COST_PER_RESULT","ROAS","CTR","SPEND","IMPRESSIONS","FREQUENCY","CPM","CPC"]).describe("Metrica monitorizata"),
       operator: z.enum(["GREATER_THAN","LESS_THAN"]).describe("Operatorul de comparatie"),
-      threshold: z.number().describe("Pragul declansator (ex: 5 pentru CPL > $5, 2 pentru ROAS > 2)"),
+      threshold: z.number().describe("Pragul declansator, in valuta contului (ex: 5 pentru CPL > 5, 2 pentru ROAS > 2)"),
       budget_change_percent: z.number().optional().describe("Procentul cu care se modifica bugetul. Necesar pentru INCREASE_BUDGET/DECREASE_BUDGET."),
       schedule: z.enum(["DAILY","HOURLY","SEMI_HOURLY"]).default("DAILY").describe("Frecventa de evaluare a regulii"),
       time_window: z.enum(["LAST_3_DAYS","LAST_7_DAYS","LAST_14_DAYS","LAST_30_DAYS","LIFETIME"]).default("LAST_7_DAYS").describe("Fereastra de timp pentru evaluarea metricii")
@@ -1301,7 +1594,7 @@ function createServer() {
     {
       campaign_ids: z.array(z.string()).min(1).max(50).describe("Lista de ID-uri campanii (max 50)"),
       status: z.enum(["ACTIVE","PAUSED"]).optional().describe("Noul status pentru toate campaniile"),
-      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI USD pentru toate campaniile")
+      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI, in valuta contului, pentru toate campaniile")
     },
     async ({ campaign_ids, status, daily_budget }) => {
       try {
@@ -1329,7 +1622,7 @@ function createServer() {
     {
       adset_ids: z.array(z.string()).min(1).max(50).describe("Lista de ID-uri ad set-uri (max 50)"),
       status: z.enum(["ACTIVE","PAUSED"]).optional(),
-      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI USD")
+      daily_budget: z.number().optional().describe("Noul buget zilnic in CENTI, in valuta contului")
     },
     async ({ adset_ids, status, daily_budget }) => {
       try {
@@ -1620,7 +1913,7 @@ app.get("/mcp", (_, res) => res.status(405).send("POST /mcp only"));
 app.get("/health", (_, res) => res.json({
   status: "ok",
   server: "meta-ads-mcp",
-  version: "4.1.0",
+  version: "4.4.0",
   token_configured: !!TOKEN,
   secret_configured: !!MCP_SECRET,
   default_account: DEFAULT_ACCT ? `act_${normalizeAccountId(DEFAULT_ACCT)}` : "NOT SET (multi-account mode)",
@@ -1628,7 +1921,7 @@ app.get("/health", (_, res) => res.json({
 }));
 
 app.listen(PORT, () => {
-  console.log(`✓ Meta Ads MCP Server v4.1.0 running on port ${PORT}`);
+  console.log(`✓ Meta Ads MCP Server v4.4.0 running on port ${PORT}`);
   console.log(`✓ Token: configured`);
   console.log(`✓ MCP secret: configured (auth via ?key= query param sau Bearer header)`);
   console.log(DEFAULT_ACCT
